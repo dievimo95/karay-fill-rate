@@ -15,7 +15,7 @@ import pdfplumber
 import streamlit as st
 from sqlalchemy import (
     Column, DateTime, Float, ForeignKey, Index, Integer, MetaData, String, Table,
-    Text, create_engine, delete, insert, select,
+    Text, create_engine, delete, insert, select, update,
 )
 
 
@@ -175,7 +175,12 @@ def odoo_invoice_rows(text: str, default_oc: str) -> list[dict]:
         r"(?=^\d{8}\s+\[|^FORMA DE PAGO|^Page:|\Z)",
         re.M | re.S,
     )
-    qty_price = re.compile(r"(?P<qty>\d+[.,]\d{4})\s+(?P<price>\d+[.,]\d{5})")
+    # Quantities may use Ecuadorian thousands separators (for example
+    # 3.624,0000). Matching only the final digits would turn that into 624.
+    number_with_4_decimals = r"(?:\d{1,3}(?:\.\d{3})+|\d+),\d{4}"
+    qty_price = re.compile(
+        rf"(?P<qty>{number_with_4_decimals})\s+(?P<price>\d+[.,]\d{{5}})"
+    )
     rows = []
     for match in row_pattern.finditer(text):
         body = re.sub(r"\s+", " ", match.group("body")).strip()
@@ -193,6 +198,12 @@ def odoo_invoice_rows(text: str, default_oc: str) -> list[dict]:
             "precio": normalize_number(amounts.group("price")),
             "tipo": "factura",
         })
+    # Keep the official document total once per invoice. This lets the UI show
+    # both the taxable/base sale and the amount including VAT without counting
+    # the same invoice total once for every product line.
+    total_matches = re.findall(r"^Total\s+\$\s*([\d.,]+)\s*$", text, re.I | re.M)
+    if rows and total_matches:
+        rows[0]["total_documento"] = normalize_number(total_matches[-1])
     return rows
 
 
@@ -316,13 +327,18 @@ def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFr
     result["venta_facturada"] = result["facturadas"] * result["precio_unitario"]
     result["venta_perdida"] = result["pendientes"] * result["precio_unitario"]
     result["fill_rate"] = result.apply(lambda r: 100 * r.facturadas / r.pedidas if r.pedidas else 0.0, axis=1)
-    return result[DETAIL_COLUMNS].sort_values(["oc", "producto"]).reset_index(drop=True)
+    detail = result[DETAIL_COLUMNS].sort_values(["oc", "producto"]).reset_index(drop=True)
+    detail.attrs["total_con_iva"] = (
+        float(pd.to_numeric(invoices.get("total_documento", 0), errors="coerce").fillna(0).sum())
+        if "total_documento" in invoices else 0.0
+    )
+    return detail
 
 
 def totals(detail: pd.DataFrame) -> dict[str, float]:
     ordered = float(detail["pedidas"].sum())
     billed = float(detail["facturadas"].sum())
-    return {
+    summary = {
         "unidades_pedidas": ordered,
         "unidades_facturadas": billed,
         "fill_rate": (100 * billed / ordered) if ordered else 0.0,
@@ -330,6 +346,8 @@ def totals(detail: pd.DataFrame) -> dict[str, float]:
         "venta_facturada": float(detail["venta_facturada"].sum()),
         "venta_perdida": float(detail["venta_perdida"].sum()),
     }
+    summary["total_con_iva"] = float(detail.attrs.get("total_con_iva", summary["venta_facturada"]))
+    return summary
 
 
 def file_fingerprint(order_files, invoice_files) -> str:
@@ -348,9 +366,7 @@ def save_run(detail: pd.DataFrame, summary: dict, cliente: str, usuario: str, or
     fingerprint = file_fingerprint(order_files, invoice_files)
     with get_engine().begin() as db:
         existing = db.execute(select(cargas_table.c.id).where(cargas_table.c.fingerprint == fingerprint)).first()
-        if existing:
-            return int(existing.id), False
-        result = db.execute(insert(cargas_table).values(
+        values = dict(
             fecha=datetime.now(), cliente=cliente, usuario=usuario,
             fill_rate=float(summary["fill_rate"]), venta_potencial=float(summary["venta_potencial"]),
             venta_facturada=float(summary["venta_facturada"]), venta_perdida=float(summary["venta_perdida"]),
@@ -360,8 +376,16 @@ def save_run(detail: pd.DataFrame, summary: dict, cliente: str, usuario: str, or
             nombres_pedidos=json.dumps([f.name for f in order_files], ensure_ascii=False),
             nombres_facturas=json.dumps([f.name for f in invoice_files], ensure_ascii=False),
             fingerprint=fingerprint,
-        ))
-        run_id = int(result.inserted_primary_key[0])
+        )
+        if existing:
+            run_id = int(existing.id)
+            db.execute(update(cargas_table).where(cargas_table.c.id == run_id).values(**values))
+            db.execute(delete(detalle_table).where(detalle_table.c.carga_id == run_id))
+            created = False
+        else:
+            result = db.execute(insert(cargas_table).values(**values))
+            run_id = int(result.inserted_primary_key[0])
+            created = True
         records = []
         for _, row in detail.iterrows():
             record = {"carga_id": run_id}
@@ -369,7 +393,7 @@ def save_run(detail: pd.DataFrame, summary: dict, cliente: str, usuario: str, or
                 record[column] = str(row[column]) if column in ("oc", "codigo", "producto") else float(row[column])
             records.append(record)
         db.execute(insert(detalle_table), records)
-    return run_id, True
+    return run_id, created
 
 
 def money(value: float) -> str:
@@ -377,11 +401,12 @@ def money(value: float) -> str:
 
 
 def show_metrics(summary: dict) -> None:
-    columns = st.columns(4)
+    columns = st.columns(5)
     columns[0].metric("Fill Rate", f"{summary['fill_rate']:.2f}%")
     columns[1].metric("Venta potencial", money(summary["venta_potencial"]))
     columns[2].metric("Venta facturada", money(summary["venta_facturada"]))
-    columns[3].metric("Venta dejada de facturar", money(summary["venta_perdida"]))
+    columns[3].metric("Total facturas con IVA", money(summary["total_con_iva"]))
+    columns[4].metric("Venta dejada de facturar", money(summary["venta_perdida"]))
     st.caption(f"{summary['unidades_facturadas']:,.0f} de {summary['unidades_pedidas']:,.0f} unidades atendidas")
 
 
@@ -416,7 +441,7 @@ def processing_tab() -> None:
         if created:
             st.success(f"Procesamiento #{run_id} guardado correctamente en el Histórico.")
         else:
-            st.info(f"Estos mismos archivos ya estaban guardados como procesamiento #{run_id}; no se duplicaron.")
+            st.info(f"El procesamiento #{run_id} fue recalculado y actualizado sin crear un duplicado.")
         for warning in order_warnings + invoice_warnings:
             st.warning(warning)
 
