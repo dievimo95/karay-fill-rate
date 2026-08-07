@@ -181,7 +181,24 @@ def invoice_oc(text: str) -> str:
     )
     if explicit:
         return re.sub(r"\s+", "", explicit.group(1)).upper()
+    # Casa Deli uses the Odoo sales-order origin as its order reference.
+    if re.search(r"CASA DELI", text, re.I):
+        origin = re.search(r"\bOrigen\s*:\s*([A-Z]\d{4,})", text, re.I)
+        if origin:
+            return origin.group(1).upper()
     return find_context(text)[0]
+
+
+def known_customer(text: str) -> str:
+    return next((
+        name for marker, name in (
+            (r"CORPORACION FAVORITA|SUPERMAXI", "Corporación Favorita"),
+            (r"CASA DELI", "Casa Deli"),
+            (r"GERARDO ORTIZ E HIJOS", "Coral / Gerardo Ortiz"),
+            (r"TIENDAS INDUSTRIAL(?:ES)? ASOCIADAS|\bTIA S\.A", "Tía"),
+            (r"CORPORACION EL ROSADO", "Corporación El Rosado"),
+        ) if re.search(marker, text, re.I)
+    ), "")
 
 
 def favorita_order_rows(text: str) -> list[dict]:
@@ -254,7 +271,11 @@ def coral_order_rows(text: str, tables: Iterable[list[list[str | None]]]) -> lis
     """Read Gerardo Ortiz / Coral purchase orders."""
     if "GERARDO ORTIZ E HIJOS" not in text.upper():
         return []
-    oc_match = re.search(r"Ped\.\s*Compra:\s*(\d+)", text, re.I)
+    # The invoice uses the short document reference (BM156427/CA078886),
+    # printed in the order header, rather than the numeric purchase ID.
+    oc_match = re.search(r"GERARDO ORTIZ E HIJOS CIA\s+([A-Z]{2}\d+)", text, re.I)
+    if not oc_match:
+        oc_match = re.search(r"Ped\.\s*Compra:\s*(\d+)", text, re.I)
     oc = oc_match.group(1) if oc_match else ""
     rows = []
     for table in tables:
@@ -438,6 +459,7 @@ def odoo_invoice_bundle_rows(text: str) -> list[dict]:
         for line_number, row in enumerate(parsed, start=1):
             row["factura_numero"] = invoice_number
             row["linea_factura"] = line_number
+            row["cliente"] = known_customer(invoice_text) or "Cliente sin identificar"
         rows.extend(parsed)
     return rows
 
@@ -539,6 +561,10 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
             else:
                 rows = odoo_invoice_bundle_rows(text) or odoo_invoice_rows(text, oc)
             rows = rows or table_rows(tables, document_type, oc) or text_rows(text, document_type, oc)
+            if document_type == "pedido":
+                detected_order_client = known_customer(text) or client or "Cliente sin identificar"
+                for row in rows:
+                    row["cliente"] = detected_order_client
             if not rows:
                 warnings.append(f"{uploaded.name}: no se reconocieron líneas de productos.")
             if document_type == "factura":
@@ -673,6 +699,9 @@ def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFr
             frame["cantidad"] = 0.0
         if "precio" not in frame:
             frame["precio"] = 0.0
+    if "cliente" not in orders:
+        orders["cliente"] = "Cliente sin identificar"
+    orders["cliente"] = orders["cliente"].fillna("Cliente sin identificar").astype(str).str.strip()
 
     def normalize_internal(value: object) -> str:
         digits = re.sub(r"\D", "", str(value or ""))
@@ -719,7 +748,8 @@ def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFr
     orders["match_key"] = orders.apply(match_key, axis=1)
     invoices["match_key"] = invoices.apply(match_key, axis=1)
     order_group = orders.groupby("match_key", as_index=False).agg(
-        oc=("oc", "first"), codigo=("codigo", "first"), producto=("producto", "first"),
+        cliente=("cliente", "first"), oc=("oc", "first"),
+        codigo=("codigo", "first"), producto=("producto", "first"),
         pedidas=("cantidad", "sum"), precio_unitario=("precio", "max"),
     )
     billed = invoices.groupby("match_key", as_index=False)["cantidad"].sum().rename(columns={"cantidad": "facturadas_raw"}) if not invoices.empty else pd.DataFrame(columns=["match_key", "facturadas_raw"])
@@ -731,7 +761,7 @@ def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFr
     result["venta_facturada"] = result["facturadas"] * result["precio_unitario"]
     result["venta_perdida"] = result["pendientes"] * result["precio_unitario"]
     result["fill_rate"] = result.apply(lambda r: 100 * r.facturadas / r.pedidas if r.pedidas else 0.0, axis=1)
-    detail = result[DETAIL_COLUMNS].sort_values(["oc", "producto"]).reset_index(drop=True)
+    detail = result[["cliente", *DETAIL_COLUMNS]].sort_values(["cliente", "oc", "producto"]).reset_index(drop=True)
     detail.attrs["total_con_iva"] = (
         float(pd.to_numeric(invoices.get("total_documento", 0), errors="coerce").fillna(0).sum())
         if "total_documento" in invoices else 0.0
@@ -752,6 +782,23 @@ def totals(detail: pd.DataFrame) -> dict[str, float]:
     }
     summary["total_con_iva"] = float(detail.attrs.get("total_con_iva", summary["venta_facturada"]))
     return summary
+
+
+def customer_unit_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    """Summarize requested, billed and pending units for each customer."""
+    if "cliente" not in detail or detail.empty:
+        return pd.DataFrame()
+    summary = detail.groupby("cliente", as_index=False).agg(
+        unidades_solicitadas=("pedidas", "sum"),
+        unidades_facturadas=("facturadas", "sum"),
+        unidades_pendientes=("pendientes", "sum"),
+    )
+    summary["cumplimiento"] = summary.apply(
+        lambda row: 100 * row.unidades_facturadas / row.unidades_solicitadas
+        if row.unidades_solicitadas else 0.0,
+        axis=1,
+    )
+    return summary.sort_values("cliente").reset_index(drop=True)
 
 
 def file_fingerprint(order_files, invoice_files) -> str:
@@ -831,14 +878,16 @@ def processing_tab() -> None:
     cliente = meta_left.text_input("Cliente (opcional)", placeholder="Ej. Corporación Favorita")
     usuario = meta_right.text_input("Responsable", value=st.session_state.get("username", "Operador"), disabled=True)
 
-    if st.button("Procesar y guardar", type="primary", width="stretch"):
+    action_left, action_right = st.columns(2)
+    process_clicked = action_left.button("1. Procesar y revisar", width="stretch")
+
+    if process_clicked:
         if not order_files or not invoice_files:
             st.error("Selecciona al menos un pedido y una factura PDF.")
             return
         with st.spinner("Leyendo y conciliando los documentos..."):
             order_rows, order_clients, order_warnings = parse_files(order_files, "pedido")
             invoice_rows, invoice_clients, invoice_warnings = parse_files(invoice_files, "factura")
-            save_invoice_ledger(invoice_rows)
             try:
                 detail = reconcile(order_rows, invoice_rows)
             except ValueError as exc:
@@ -848,18 +897,75 @@ def processing_tab() -> None:
                 return
             summary = totals(detail)
             detected_client = cliente.strip() or next(iter(order_clients + invoice_clients), "Sin especificar")
-            run_id, created = save_run(detail, summary, detected_client, usuario.strip() or "Operador", order_files, invoice_files)
+            st.session_state["pending_result"] = {
+                "detail": detail,
+                "summary": summary,
+                "invoice_rows": invoice_rows,
+                "cliente": detected_client,
+                "usuario": usuario.strip() or "Operador",
+                "fingerprint": file_fingerprint(order_files, invoice_files),
+                "warnings": order_warnings + invoice_warnings,
+            }
             st.session_state["last_result"] = (detail, summary)
-        if created:
-            st.success(f"Procesamiento #{run_id} guardado correctamente en el Histórico.")
-        else:
-            st.info(f"El procesamiento #{run_id} fue recalculado y actualizado sin crear un duplicado.")
+        st.info(
+            "Resultados procesados para revisión. Todavía no se guardaron en el Histórico "
+            "ni se actualizó el Forecast. Revisa la información y luego pulsa Guardar."
+        )
         for warning in order_warnings + invoice_warnings:
             st.warning(warning)
+
+    save_clicked = action_right.button(
+        "2. Guardar y actualizar Forecast",
+        type="primary",
+        width="stretch",
+        disabled="pending_result" not in st.session_state,
+    )
+    if save_clicked:
+        pending = st.session_state.get("pending_result")
+        if not pending or not order_files or not invoice_files:
+            st.error("Primero carga los archivos y pulsa Procesar y revisar.")
+        elif file_fingerprint(order_files, invoice_files) != pending["fingerprint"]:
+            st.error("Los archivos cambiaron después de la revisión. Pulsa nuevamente Procesar y revisar.")
+        else:
+            with st.spinner("Guardando el Histórico y actualizando el Forecast..."):
+                # The Forecast reads this cumulative, invoice-level ledger.
+                # Nothing reaches it until the user explicitly confirms Save.
+                save_invoice_ledger(pending["invoice_rows"])
+                run_id, created = save_run(
+                    pending["detail"], pending["summary"], pending["cliente"],
+                    pending["usuario"], order_files, invoice_files,
+                )
+            del st.session_state["pending_result"]
+            if created:
+                st.success(
+                    f"Procesamiento #{run_id} guardado. El Histórico y el Forecast fueron actualizados."
+                )
+            else:
+                st.info(
+                    f"Procesamiento #{run_id} actualizado sin duplicados. El Forecast fue recalculado."
+                )
 
     if "last_result" in st.session_state:
         detail, summary = st.session_state["last_result"]
         show_metrics(summary)
+        customer_summary = customer_unit_summary(detail)
+        if not customer_summary.empty:
+            st.markdown("### Cumplimiento por cliente (unidades)")
+            st.dataframe(customer_summary, width="stretch", hide_index=True, column_config={
+                "cliente": st.column_config.TextColumn("Cliente"),
+                "unidades_solicitadas": st.column_config.NumberColumn("Unidades solicitadas", format="%.0f"),
+                "unidades_facturadas": st.column_config.NumberColumn("Unidades facturadas", format="%.0f"),
+                "unidades_pendientes": st.column_config.NumberColumn("Unidades pendientes", format="%.0f"),
+                "cumplimiento": st.column_config.ProgressColumn(
+                    "Cumplimiento", min_value=0, max_value=100, format="%.2f%%"
+                ),
+            })
+            st.download_button(
+                "Descargar resumen por cliente CSV",
+                customer_summary.to_csv(index=False).encode("utf-8-sig"),
+                "cumplimiento_por_cliente.csv",
+                "text/csv",
+            )
         st.dataframe(detail, width="stretch", hide_index=True, column_config={
             "fill_rate": st.column_config.NumberColumn("Fill Rate", format="%.2f%%"),
             "precio_unitario": st.column_config.NumberColumn("Precio unitario", format="$%.2f"),

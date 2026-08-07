@@ -8,6 +8,10 @@ La versión 2.4 agrega un dashboard mensual de Forecast por unidades. Permite ca
 
 La versión 2.5 amplía la lectura de pedidos para los formatos reales de Corporación Favorita, Casa Deli/Odoo, Coral (Gerardo Ortiz), Tía y Corporación El Rosado. El cruce admite tanto código interno como código de barras.
 
+La pantalla de procesamiento incluye un resumen de cumplimiento por cliente en unidades: solicitadas, facturadas, pendientes y porcentaje atendido, con descarga en CSV.
+
+El procesamiento se realiza en dos pasos. `Procesar y revisar` calcula y muestra los resultados sin modificar datos. `Guardar y actualizar Forecast` confirma la información, la guarda en el Histórico y actualiza el acumulado facturado que disminuye el saldo pendiente del Forecast.
+
 ## Qué incluye
 
 - Carga múltiple de pedidos y facturas PDF.
