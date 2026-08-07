@@ -801,6 +801,14 @@ def customer_unit_summary(detail: pd.DataFrame) -> pd.DataFrame:
     return summary.sort_values("cliente").reset_index(drop=True)
 
 
+def clear_operational_data() -> None:
+    """Delete test runs and billed units while preserving every forecast row."""
+    with get_engine().begin() as db:
+        db.execute(delete(detalle_table))
+        db.execute(delete(cargas_table))
+        db.execute(delete(facturas_acumuladas_table))
+
+
 def file_fingerprint(order_files, invoice_files) -> str:
     digest = hashlib.sha256()
     for role, files in (("PEDIDO", order_files), ("FACTURA", invoice_files)):
@@ -980,6 +988,30 @@ def history_tab() -> None:
     st.subheader("Histórico")
     with get_engine().connect() as db:
         history = pd.read_sql(select(cargas_table).order_by(cargas_table.c.fecha.desc()), db)
+
+    with st.expander("Administrar datos cargados"):
+        st.warning(
+            "Esta opción elimina el Histórico, sus detalles y las facturas acumuladas. "
+            "El Forecast inicial y sus cantidades se conservarán."
+        )
+        confirmed = st.checkbox(
+            "Confirmo que deseo borrar los datos de prueba y conservar el Forecast",
+            key="confirm_clear_operational_data",
+        )
+        if st.button(
+            "Borrar datos de prueba",
+            type="primary",
+            disabled=not confirmed,
+            key="clear_operational_data",
+        ):
+            clear_operational_data()
+            st.session_state.pop("last_result", None)
+            st.session_state.pop("pending_result", None)
+            st.success(
+                "Datos de prueba eliminados. El Forecast inicial y sus unidades permanecen intactos."
+            )
+            st.stop()
+
     if history.empty:
         st.info("Todavía no hay procesamientos guardados.")
         return

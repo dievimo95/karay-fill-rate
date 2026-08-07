@@ -12,6 +12,8 @@ La pantalla de procesamiento incluye un resumen de cumplimiento por cliente en u
 
 El procesamiento se realiza en dos pasos. `Procesar y revisar` calcula y muestra los resultados sin modificar datos. `Guardar y actualizar Forecast` confirma la información, la guarda en el Histórico y actualiza el acumulado facturado que disminuye el saldo pendiente del Forecast.
 
+En la pestaña `Histórico`, la sección `Administrar datos cargados` permite eliminar procesamientos, detalles y facturas acumuladas de prueba. Esta limpieza conserva intactos el Forecast inicial, sus productos y sus unidades planificadas.
+
 ## Qué incluye
 
 - Carga múltiple de pedidos y facturas PDF.
