@@ -14,8 +14,9 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 from sqlalchemy import (
-    Column, DateTime, Float, ForeignKey, Index, Integer, MetaData, String, Table,
-    Text, create_engine, delete, insert, select, update,
+    Column, Date as SQLDate, DateTime, Float, ForeignKey, Index, Integer,
+    MetaData, String, Table, Text, UniqueConstraint, create_engine, delete,
+    insert, select, update,
 )
 
 
@@ -60,6 +61,40 @@ detalle_table = Table(
 Index("idx_detalle_carga", detalle_table.c.carga_id)
 Index("idx_detalle_oc", detalle_table.c.oc)
 Index("idx_cargas_fecha", cargas_table.c.fecha)
+
+forecast_table = Table(
+    "forecast", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("periodo", String(7), nullable=False, unique=True),
+    Column("archivo", String(255), nullable=False, default=""),
+    Column("actualizado", DateTime, nullable=False),
+)
+forecast_detalle_table = Table(
+    "forecast_detalle", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("forecast_id", Integer, ForeignKey("forecast.id", ondelete="CASCADE"), nullable=False),
+    Column("codigo_interno", String(20), nullable=False),
+    Column("ean", String(20), nullable=False, default=""),
+    Column("producto", Text, nullable=False, default=""),
+    Column("unidades", Float, nullable=False),
+    UniqueConstraint("forecast_id", "codigo_interno", name="uq_forecast_producto"),
+)
+facturas_acumuladas_table = Table(
+    "facturas_acumuladas", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("archivo_hash", String(64), nullable=False),
+    Column("archivo", String(255), nullable=False),
+    Column("linea", Integer, nullable=False),
+    Column("fecha_documento", SQLDate, nullable=False),
+    Column("codigo_interno", String(20), nullable=False, default=""),
+    Column("ean", String(20), nullable=False, default=""),
+    Column("producto", Text, nullable=False, default=""),
+    Column("unidades", Float, nullable=False),
+    UniqueConstraint("archivo_hash", "linea", name="uq_factura_archivo_linea"),
+)
+Index("idx_forecast_periodo", forecast_table.c.periodo)
+Index("idx_facturas_fecha", facturas_acumuladas_table.c.fecha_documento)
+Index("idx_facturas_codigo", facturas_acumuladas_table.c.codigo_interno)
 
 DETAIL_COLUMNS = [
     "oc", "codigo", "producto", "pedidas", "facturadas", "pendientes",
@@ -181,6 +216,11 @@ def odoo_invoice_rows(text: str, default_oc: str) -> list[dict]:
     qty_price = re.compile(
         rf"(?P<qty>{number_with_4_decimals})\s+(?P<price>\d+[.,]\d{{5}})"
     )
+    date_match = re.search(r"Fecha de emisi[oó]n:\s*(\d{2}/\d{2}/\d{4})", text, re.I)
+    document_date = (
+        datetime.strptime(date_match.group(1), "%d/%m/%Y").date()
+        if date_match else date.today()
+    )
     rows = []
     for match in row_pattern.finditer(text):
         body = re.sub(r"\s+", " ", match.group("body")).strip()
@@ -192,10 +232,12 @@ def odoo_invoice_rows(text: str, default_oc: str) -> list[dict]:
         description = re.sub(r"\s*-?\s*Ref\.?\s*$", "", description, flags=re.I)
         rows.append({
             "oc": default_oc,
+            "codigo_interno": match.group("internal"),
             "codigo": eans[-1],
             "producto": description,
             "cantidad": normalize_number(amounts.group("qty")),
             "precio": normalize_number(amounts.group("price")),
+            "fecha_documento": document_date,
             "tipo": "factura",
         })
     # Keep the official document total once per invoice. This lets the UI show
@@ -290,10 +332,109 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
             rows = rows or table_rows(tables, document_type, oc) or text_rows(text, document_type, oc)
             if not rows:
                 warnings.append(f"{uploaded.name}: no se reconocieron líneas de productos.")
+            if document_type == "factura":
+                uploaded.seek(0)
+                file_hash = hashlib.sha256(uploaded.read()).hexdigest()
+                uploaded.seek(0)
+                for line_number, row in enumerate(rows, start=1):
+                    row["archivo_hash"] = file_hash
+                    row["archivo_nombre"] = uploaded.name
+                    row["linea"] = line_number
             all_rows.extend(rows)
         except Exception as exc:
             warnings.append(f"{uploaded.name}: no se pudo leer ({exc}).")
     return pd.DataFrame(all_rows), clients, warnings
+
+
+def save_invoice_ledger(invoice_rows: pd.DataFrame) -> None:
+    """Refresh uploaded invoices in the cumulative ledger without duplicating files."""
+    if invoice_rows.empty or "archivo_hash" not in invoice_rows:
+        return
+    with get_engine().begin() as db:
+        for file_hash in invoice_rows["archivo_hash"].dropna().unique():
+            db.execute(delete(facturas_acumuladas_table).where(
+                facturas_acumuladas_table.c.archivo_hash == str(file_hash)
+            ))
+        records = []
+        for _, row in invoice_rows.iterrows():
+            records.append({
+                "archivo_hash": str(row.get("archivo_hash", "")),
+                "archivo": str(row.get("archivo_nombre", "")),
+                "linea": int(row.get("linea", 0)),
+                "fecha_documento": row.get("fecha_documento") or date.today(),
+                "codigo_interno": str(row.get("codigo_interno", "")).strip().zfill(8),
+                "ean": str(row.get("codigo", "")).strip(),
+                "producto": str(row.get("producto", "")),
+                "unidades": float(row.get("cantidad", 0)),
+            })
+        if records:
+            db.execute(insert(facturas_acumuladas_table), records)
+
+
+def forecast_dataframe(uploaded_file) -> pd.DataFrame:
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    uploaded_file.seek(0)
+    name = uploaded_file.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        source = pd.read_excel(io.BytesIO(raw))
+    else:
+        source = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", dtype=str)
+    normalized = {
+        str(column).strip().lower().replace("ó", "o").replace("í", "i"): column
+        for column in source.columns
+    }
+    code_column = next((original for key, original in normalized.items() if key in ("cod", "codigo", "codigo producto")), None)
+    product_column = next((original for key, original in normalized.items() if "producto" in key or "descripcion" in key), None)
+    units_column = next((original for key, original in normalized.items() if "unidad" in key or "forecast" in key), None)
+    if code_column is None or units_column is None:
+        raise ValueError("El archivo debe incluir las columnas COD y Unidades.")
+    rows = []
+    for _, item in source.iterrows():
+        code_digits = re.sub(r"\D", "", str(item.get(code_column, "")))
+        if not code_digits:
+            continue
+        product = str(item.get(product_column, "") if product_column is not None else "").strip()
+        eans = re.findall(r"(?<!\d)(\d{12,13})(?!\d)", product)
+        rows.append({
+            "codigo_interno": code_digits.zfill(8),
+            "ean": eans[-1] if eans else "",
+            "producto": product,
+            "unidades": normalize_number(item.get(units_column, 0)),
+        })
+    result = pd.DataFrame(rows)
+    if result.empty:
+        raise ValueError("No se encontraron productos válidos en el forecast.")
+    return result.groupby("codigo_interno", as_index=False).agg(
+        ean=("ean", "first"), producto=("producto", "first"), unidades=("unidades", "sum")
+    )
+
+
+def save_forecast(period: str, uploaded_file, forecast_rows: pd.DataFrame) -> int:
+    with get_engine().begin() as db:
+        existing = db.execute(select(forecast_table.c.id).where(forecast_table.c.periodo == period)).first()
+        if existing:
+            forecast_id = int(existing.id)
+            db.execute(update(forecast_table).where(forecast_table.c.id == forecast_id).values(
+                archivo=uploaded_file.name, actualizado=datetime.now()
+            ))
+            db.execute(delete(forecast_detalle_table).where(forecast_detalle_table.c.forecast_id == forecast_id))
+        else:
+            created = db.execute(insert(forecast_table).values(
+                periodo=period, archivo=uploaded_file.name, actualizado=datetime.now()
+            ))
+            forecast_id = int(created.inserted_primary_key[0])
+        db.execute(insert(forecast_detalle_table), [
+            {
+                "forecast_id": forecast_id,
+                "codigo_interno": str(row.codigo_interno),
+                "ean": str(row.ean),
+                "producto": str(row.producto),
+                "unidades": float(row.unidades),
+            }
+            for row in forecast_rows.itertuples(index=False)
+        ])
+    return forecast_id
 
 
 def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFrame:
@@ -427,6 +568,7 @@ def processing_tab() -> None:
         with st.spinner("Leyendo y conciliando los documentos..."):
             order_rows, order_clients, order_warnings = parse_files(order_files, "pedido")
             invoice_rows, invoice_clients, invoice_warnings = parse_files(invoice_files, "factura")
+            save_invoice_ledger(invoice_rows)
             try:
                 detail = reconcile(order_rows, invoice_rows)
             except ValueError as exc:
@@ -494,6 +636,126 @@ def history_tab() -> None:
     st.download_button("Descargar este detalle", detail.to_csv(index=False).encode("utf-8-sig"), f"fill_rate_{selected}.csv", "text/csv")
 
 
+def forecast_tab() -> None:
+    st.subheader("Fill Rate Interno")
+    st.write("Carga el forecast del mes y compáralo con todas las facturas procesadas, sin duplicar archivos.")
+    upload_left, upload_right = st.columns([2, 1])
+    forecast_file = upload_left.file_uploader(
+        "Forecast Excel, CSV o TXT", type=["xlsx", "xls", "csv", "txt"], key="forecast_file"
+    )
+    month_value = upload_right.date_input("Mes del forecast", value=date.today().replace(day=1), key="forecast_month")
+    if st.button("Guardar o reemplazar forecast", type="primary", width="stretch"):
+        if forecast_file is None:
+            st.error("Selecciona el archivo del forecast.")
+        else:
+            try:
+                forecast_rows = forecast_dataframe(forecast_file)
+                period = month_value.strftime("%Y-%m")
+                save_forecast(period, forecast_file, forecast_rows)
+                st.success(
+                    f"Forecast {period} guardado: {len(forecast_rows)} productos y "
+                    f"{forecast_rows['unidades'].sum():,.1f} unidades."
+                )
+            except Exception as exc:
+                st.error(f"No se pudo cargar el forecast: {exc}")
+
+    with get_engine().connect() as db:
+        available = pd.read_sql(select(forecast_table).order_by(forecast_table.c.periodo.desc()), db)
+    if available.empty:
+        st.info("Carga el primer forecast para ver el avance mensual.")
+        return
+
+    selected_period = st.selectbox("Periodo", available["periodo"].tolist(), key="forecast_period")
+    forecast_id = int(available.loc[available["periodo"] == selected_period, "id"].iloc[0])
+    year, month = map(int, selected_period.split("-"))
+    period_start = date(year, month, 1)
+    period_end = date(year + (month == 12), 1 if month == 12 else month + 1, 1)
+    with get_engine().connect() as db:
+        forecast_rows = pd.read_sql(
+            select(
+                forecast_detalle_table.c.codigo_interno,
+                forecast_detalle_table.c.ean,
+                forecast_detalle_table.c.producto,
+                forecast_detalle_table.c.unidades.label("forecast"),
+            ).where(forecast_detalle_table.c.forecast_id == forecast_id), db,
+        )
+        invoices = pd.read_sql(
+            select(
+                facturas_acumuladas_table.c.codigo_interno,
+                facturas_acumuladas_table.c.ean,
+                facturas_acumuladas_table.c.producto,
+                facturas_acumuladas_table.c.unidades,
+            ).where(
+                facturas_acumuladas_table.c.fecha_documento >= period_start,
+                facturas_acumuladas_table.c.fecha_documento < period_end,
+            ), db,
+        )
+    if invoices.empty:
+        billed = pd.DataFrame(columns=["codigo_interno", "facturado"])
+    else:
+        billed = invoices.groupby("codigo_interno", as_index=False)["unidades"].sum().rename(
+            columns={"unidades": "facturado"}
+        )
+    report = forecast_rows.merge(billed, on="codigo_interno", how="left")
+    report["facturado"] = report["facturado"].fillna(0.0)
+    report["pendiente"] = (report["forecast"] - report["facturado"]).clip(lower=0)
+    report["excedente"] = (report["facturado"] - report["forecast"]).clip(lower=0)
+    report["cumplimiento"] = report.apply(
+        lambda row: 100 * row.facturado / row.forecast if row.forecast > 0 else (100 if row.facturado > 0 else 0),
+        axis=1,
+    )
+    forecast_total = float(report["forecast"].sum())
+    billed_total = float(report["facturado"].sum())
+    pending_total = float(report["pendiente"].sum())
+    achievement = 100 * billed_total / forecast_total if forecast_total else 0.0
+    unmatched_units = 0.0
+    if not invoices.empty:
+        forecast_codes = set(report["codigo_interno"])
+        unmatched_units = float(invoices.loc[~invoices["codigo_interno"].isin(forecast_codes), "unidades"].sum())
+
+    metrics = st.columns(5)
+    metrics[0].metric("Forecast", f"{forecast_total:,.1f}")
+    metrics[1].metric("Facturado acumulado", f"{billed_total:,.1f}")
+    metrics[2].metric("Pendiente", f"{pending_total:,.1f}")
+    metrics[3].metric("Cumplimiento", f"{achievement:.1f}%")
+    metrics[4].metric("Sin coincidencia", f"{unmatched_units:,.1f}")
+    st.progress(min(max(achievement / 100, 0.0), 1.0), text=f"Avance de {selected_period}: {achievement:.1f}%")
+    if invoices.empty:
+        st.warning("Aún no hay facturas acumuladas para este mes. Vuelve a procesarlas una vez para alimentar el forecast.")
+    if unmatched_units:
+        st.warning(f"Hay {unmatched_units:,.1f} unidades facturadas cuyos códigos no aparecen en este forecast.")
+
+    status = st.selectbox("Mostrar", ["Todos", "Pendientes", "Cumplidos", "Sobrecumplidos"])
+    visible = report.copy()
+    if status == "Pendientes":
+        visible = visible[visible["pendiente"] > 0]
+    elif status == "Cumplidos":
+        visible = visible[(visible["pendiente"] == 0) & (visible["excedente"] == 0)]
+    elif status == "Sobrecumplidos":
+        visible = visible[visible["excedente"] > 0]
+    display_columns = [
+        "codigo_interno", "producto", "forecast", "facturado", "pendiente", "excedente", "cumplimiento"
+    ]
+    st.dataframe(visible[display_columns].sort_values("pendiente", ascending=False), width="stretch", hide_index=True,
+        column_config={
+            "codigo_interno": "COD",
+            "producto": "Producto",
+            "forecast": st.column_config.NumberColumn("Forecast", format="%.1f"),
+            "facturado": st.column_config.NumberColumn("Facturado", format="%.1f"),
+            "pendiente": st.column_config.NumberColumn("Pendiente", format="%.1f"),
+            "excedente": st.column_config.NumberColumn("Excedente", format="%.1f"),
+            "cumplimiento": st.column_config.NumberColumn("Cumplimiento", format="%.1f%%"),
+        })
+    chart = report.nlargest(15, "pendiente")[["producto", "pendiente"]].set_index("producto")
+    if not chart.empty and chart["pendiente"].sum() > 0:
+        st.caption("15 productos con mayor saldo pendiente")
+        st.bar_chart(chart)
+    st.download_button(
+        "Descargar avance CSV", report[display_columns].to_csv(index=False).encode("utf-8-sig"),
+        f"forecast_{selected_period}.csv", "text/csv",
+    )
+
+
 def configured_users() -> dict[str, str]:
     try:
         users = st.secrets.get("users", {})
@@ -537,11 +799,13 @@ def main() -> None:
         return
     init_database()
     st.title("📦 Karay Fill Rate")
-    process, history = st.tabs(["📤 Procesar", "📚 Histórico"])
+    process, history, forecast = st.tabs(["📤 Procesar", "📚 Histórico", "📈 Fill Rate Interno"])
     with process:
         processing_tab()
     with history:
         history_tab()
+    with forecast:
+        forecast_tab()
 
 
 if __name__ == "__main__":
