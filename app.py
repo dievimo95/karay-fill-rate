@@ -192,10 +192,159 @@ def favorita_order_rows(text: str) -> list[dict]:
             cases = normalize_number(match.group("cases"))
             rows.append({
                 "oc": oc,
+                "codigo_interno": "",
                 "codigo": match.group("ean"),
                 "producto": re.sub(r"\s+", " ", match.group("product")).strip(),
                 "cantidad": cases * units_per_case,
                 "precio": normalize_number(match.group("price")),
+                "tipo": "pedido",
+            })
+    return rows
+
+
+def odoo_order_rows(text: str) -> list[dict]:
+    """Read customer sales orders exported from Odoo (for example S04899)."""
+    if "FECHA DE PEDIDO" not in text.upper() or "DESCRIPCIÓN CANTIDAD" not in text.upper():
+        return []
+    oc_match = re.search(r"Orden\s*#\s*([A-Z0-9-]+)", text, re.I)
+    oc = oc_match.group(1) if oc_match else ""
+    row_pattern = re.compile(
+        r"^\[(?P<internal>[A-Z0-9]+)\]\s+(?P<body>.*?)"
+        r"(?=^\[[A-Z0-9]+\]|^Base imponible|\Z)", re.M | re.S,
+    )
+    qty_price = re.compile(r"(?P<qty>(?:\d{1,3}(?:\.\d{3})+|\d+),\d{4})\s+(?:Unidades\s+)?(?P<price>\d+[.,]\d{5})")
+    rows = []
+    for match in row_pattern.finditer(text):
+        internal = match.group("internal")
+        if not internal.isdigit():
+            continue
+        body = re.sub(r"\s+", " ", match.group("body")).strip()
+        amounts = qty_price.search(body)
+        if not amounts:
+            continue
+        eans = re.findall(r"(?<!\d)(\d{12,13})(?!\d)", body)
+        description = body[:amounts.start()].strip(" -")
+        rows.append({
+            "oc": oc,
+            "codigo_interno": internal.zfill(8),
+            "codigo": eans[-1] if eans else internal.zfill(8),
+            "producto": description,
+            "cantidad": normalize_number(amounts.group("qty")),
+            "precio": normalize_number(amounts.group("price")),
+            "tipo": "pedido",
+        })
+    return rows
+
+
+def coral_order_rows(text: str, tables: Iterable[list[list[str | None]]]) -> list[dict]:
+    """Read Gerardo Ortiz / Coral purchase orders."""
+    if "GERARDO ORTIZ E HIJOS" not in text.upper():
+        return []
+    oc_match = re.search(r"Ped\.\s*Compra:\s*(\d+)", text, re.I)
+    oc = oc_match.group(1) if oc_match else ""
+    rows = []
+    for table in tables:
+        if not table or "Cod.Prov" not in " ".join(str(x or "") for x in table[0]):
+            continue
+        for cells in table[1:]:
+            if not cells or not str(cells[0] or "").strip().isdigit():
+                continue
+            codes = re.findall(r"\d{7,13}", str(cells[1] or ""))
+            internal = next((code.zfill(8) for code in codes if len(code) <= 8), "")
+            ean = next((code for code in codes if len(code) >= 12), "")
+            product = re.sub(r"^[A-Z]\s*\n", "", str(cells[2] or "")).replace("\n", " ").strip()
+            quantity = normalize_number(cells[4] if len(cells) > 4 else 0)
+            if quantity <= 0:
+                continue
+            rows.append({
+                "oc": oc,
+                "codigo_interno": internal,
+                "codigo": ean or internal,
+                "producto": product,
+                "cantidad": quantity,
+                "precio": normalize_number(cells[5] if len(cells) > 5 else 0),
+                "tipo": "pedido",
+            })
+    return rows
+
+
+def tia_order_rows(text: str, tables: Iterable[list[list[str | None]]]) -> list[dict]:
+    """Read TIA orders and use their product-homologation section for EANs."""
+    if "TIENDAS INDUSTRIALES ASOCIADAS" not in text.upper():
+        return []
+    oc_match = re.search(r"ORDEN DE COMPRA\s*N?[º°]?\s*(\d+)", text, re.I)
+    oc = oc_match.group(1) if oc_match else ""
+    homologation = {}
+    for line in text.splitlines():
+        values = re.findall(r"(?<!\d)(\d{8,13})(?!\d)", line)
+        if len(values) >= 2 and len(values[0]) == 9:
+            ean = next((value for value in values[1:] if len(value) >= 12), "")
+            internal = next((value.zfill(8) for value in values[1:] if len(value) == 8), "")
+            homologation[values[0]] = (ean, internal)
+    rows = []
+    for table in tables:
+        if not table:
+            continue
+        header_index = next((i for i, row in enumerate(table) if "CCAANNTT ((UUNNIIDD))" in str((row or [""])[0] or "")), None)
+        if header_index is None:
+            continue
+        for cells in table[header_index + 1:]:
+            if not cells or not re.fullmatch(r"\d+(?:[.,]\d+)?", str(cells[0] or "").strip()):
+                continue
+            quantity = normalize_number(cells[0])
+            client_code = re.sub(r"\D", "", str(cells[10] or "")) if len(cells) > 10 else ""
+            product = str(cells[6] or "").replace("\n", " ").strip() if len(cells) > 6 else ""
+            # Ignore homologation/footer tables that happen to begin with a
+            # numeric code but are not actual ordered product lines.
+            if len(client_code) != 9 or not product:
+                continue
+            ean, internal = homologation.get(client_code, ("", ""))
+            rows.append({
+                "oc": oc,
+                "codigo_interno": internal,
+                "codigo": ean or internal or client_code,
+                "producto": product,
+                "cantidad": quantity,
+                "precio": normalize_number(cells[11] if len(cells) > 11 else 0),
+                "tipo": "pedido",
+            })
+    return rows
+
+
+def rosado_order_rows(text: str, tables: Iterable[list[list[str | None]]]) -> list[dict]:
+    """Read El Rosado orders; CANTIDAD is cases and UXC is units per case."""
+    if "CORPORACION EL ROSADO" not in text.upper():
+        return []
+    rows = []
+    for table in tables:
+        if not table:
+            continue
+        header_index = next((i for i, row in enumerate(table) if row and str(row[0] or "").strip() == "ITEN"), None)
+        if header_index is None:
+            continue
+        oc = ""
+        for header_row in table[:header_index]:
+            if header_row and str(header_row[0] or "").strip() == "NUMERO DE ORDEN":
+                oc = re.sub(r"\D", "", str(header_row[2] or ""))
+                break
+        for cells in table[header_index + 1:]:
+            if not cells or not str(cells[0] or "").strip().isdigit():
+                continue
+            reference = re.sub(r"\D", "", str(cells[5] or ""))
+            internal = reference.zfill(8) if 1 <= len(reference) <= 8 else ""
+            ean = reference if len(reference) >= 12 else ""
+            units_per_case = normalize_number(cells[7] if len(cells) > 7 else 0)
+            cases = normalize_number(cells[8] if len(cells) > 8 else 0)
+            if units_per_case <= 0 or cases <= 0:
+                continue
+            case_cost = normalize_number(cells[9] if len(cells) > 9 else 0)
+            rows.append({
+                "oc": oc,
+                "codigo_interno": internal,
+                "codigo": ean or internal,
+                "producto": str(cells[2] or "").replace("\n", " ").strip(),
+                "cantidad": units_per_case * cases,
+                "precio": case_cost / units_per_case if units_per_case else 0,
                 "tipo": "pedido",
             })
     return rows
@@ -280,6 +429,7 @@ def table_rows(tables: Iterable[list[list[str | None]]], document_type: str, def
                 continue
             rows.append({
                 "oc": clean_code(cells[positions["oc"]]) if positions["oc"] is not None else default_oc,
+                "codigo_interno": "",
                 "codigo": code,
                 "producto": product,
                 "cantidad": quantity,
@@ -308,6 +458,7 @@ def text_rows(text: str, document_type: str, default_oc: str) -> list[dict]:
             continue
         rows.append({
             "oc": default_oc,
+            "codigo_interno": "",
             "codigo": clean_code(match.group("code")),
             "producto": match.group("description").strip(" -"),
             "cantidad": quantity,
@@ -323,10 +474,24 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
         try:
             text, tables = extract_pdf(uploaded)
             oc, client = find_context(text)
+            if not client:
+                customer_markers = (
+                    (r"CASA DELI", "Casa Deli"),
+                    (r"GERARDO ORTIZ E HIJOS", "Coral / Gerardo Ortiz"),
+                    (r"TIENDAS INDUSTRIALES ASOCIADAS", "Tía"),
+                    (r"CORPORACION EL ROSADO", "Corporación El Rosado"),
+                )
+                client = next((name for marker, name in customer_markers if re.search(marker, text, re.I)), "")
             if client:
                 clients.append(client)
             if document_type == "pedido":
-                rows = favorita_order_rows(text)
+                rows = (
+                    favorita_order_rows(text)
+                    or odoo_order_rows(text)
+                    or coral_order_rows(text, tables)
+                    or tia_order_rows(text, tables)
+                    or rosado_order_rows(text, tables)
+                )
             else:
                 rows = odoo_invoice_rows(text, oc)
             rows = rows or table_rows(tables, document_type, oc) or text_rows(text, document_type, oc)
@@ -443,7 +608,7 @@ def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFr
     orders = order_rows.copy()
     invoices = invoice_rows.copy()
     for frame in (orders, invoices):
-        for column in ("oc", "codigo", "producto"):
+        for column in ("oc", "codigo", "codigo_interno", "producto"):
             if column not in frame:
                 frame[column] = ""
             frame[column] = frame[column].fillna("").astype(str).str.strip()
@@ -452,9 +617,30 @@ def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFr
         if "precio" not in frame:
             frame["precio"] = 0.0
 
-    # OC + code is preferred. If a PDF has no OC, code remains a safe common key.
-    orders["match_key"] = orders.apply(lambda r: f"{r.oc}|{r.codigo}" if r.oc else r.codigo, axis=1)
-    invoices["match_key"] = invoices.apply(lambda r: f"{r.oc}|{r.codigo}" if r.oc else r.codigo, axis=1)
+    def normalize_internal(value: object) -> str:
+        digits = re.sub(r"\D", "", str(value or ""))
+        return digits.zfill(8) if digits and len(digits) <= 8 else digits
+
+    for frame in (orders, invoices):
+        frame["codigo"] = frame["codigo"].map(clean_code)
+        frame["codigo_interno"] = frame["codigo_interno"].map(normalize_internal)
+
+    # The invoice normally contains both identifiers. Use it as a homologation
+    # table so an order carrying only EAN can still match by internal code.
+    invoice_codes = invoices[
+        (invoices["codigo"] != "") & (invoices["codigo_interno"] != "")
+    ].drop_duplicates("codigo")
+    ean_to_internal = dict(zip(invoice_codes["codigo"], invoice_codes["codigo_interno"]))
+    orders["codigo_interno"] = orders.apply(
+        lambda row: row.codigo_interno or ean_to_internal.get(row.codigo, ""), axis=1
+    )
+
+    def match_key(row: pd.Series) -> str:
+        identity = row.codigo_interno or row.codigo
+        return f"{row.oc}|{identity}" if row.oc else identity
+
+    orders["match_key"] = orders.apply(match_key, axis=1)
+    invoices["match_key"] = invoices.apply(match_key, axis=1)
     order_group = orders.groupby("match_key", as_index=False).agg(
         oc=("oc", "first"), codigo=("codigo", "first"), producto=("producto", "first"),
         pedidas=("cantidad", "sum"), precio_unitario=("precio", "max"),
