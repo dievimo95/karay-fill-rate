@@ -157,7 +157,9 @@ def extract_pdf(uploaded_file) -> tuple[str, list[list[list[str | None]]]]:
             texts.append(page.extract_text(x_tolerance=2, y_tolerance=3) or "")
             tables.extend(page.extract_tables() or [])
     uploaded_file.seek(0)
-    return "\n".join(texts), tables
+    # Form-feed keeps page boundaries. It is harmless whitespace for the
+    # existing readers and lets a multi-invoice PDF be separated correctly.
+    return "\n\f\n".join(texts), tables
 
 
 def find_context(text: str) -> tuple[str, str]:
@@ -168,6 +170,18 @@ def find_context(text: str) -> tuple[str, str]:
     if not cliente and re.search(r"corporaci[oó]n\s+favorita|supermaxi", text, re.I):
         cliente = "Corporación Favorita"
     return oc, cliente
+
+
+def invoice_oc(text: str) -> str:
+    """Return numeric or alphanumeric OC printed in an invoice footer."""
+    explicit = re.search(
+        r"\bOC\s*:\s*((?:[A-Z]{1,3}\s*)?\d(?:[A-Z0-9 ]{3,18}\d))",
+        text,
+        re.I,
+    )
+    if explicit:
+        return re.sub(r"\s+", "", explicit.group(1)).upper()
+    return find_context(text)[0]
 
 
 def favorita_order_rows(text: str) -> list[dict]:
@@ -374,15 +388,17 @@ def odoo_invoice_rows(text: str, default_oc: str) -> list[dict]:
     for match in row_pattern.finditer(text):
         body = re.sub(r"\s+", " ", match.group("body")).strip()
         amounts = qty_price.search(body)
-        eans = re.findall(r"(?<!\d)(\d{13})(?!\d)", body)
-        if not amounts or not eans:
+        eans = re.findall(r"(?<!\d)(\d{12,13})(?!\d)", body)
+        if not amounts:
             continue
         description = body[:amounts.start()].strip(" -")
         description = re.sub(r"\s*-?\s*Ref\.?\s*$", "", description, flags=re.I)
         rows.append({
             "oc": default_oc,
             "codigo_interno": match.group("internal"),
-            "codigo": eans[-1],
+            # A few source invoices contain a truncated 12-digit barcode.
+            # The internal code remains authoritative for matching.
+            "codigo": eans[-1] if eans else match.group("internal"),
             "producto": description,
             "cantidad": normalize_number(amounts.group("qty")),
             "precio": normalize_number(amounts.group("price")),
@@ -395,6 +411,34 @@ def odoo_invoice_rows(text: str, default_oc: str) -> list[dict]:
     total_matches = re.findall(r"^Total\s+\$\s*([\d.,]+)\s*$", text, re.I | re.M)
     if rows and total_matches:
         rows[0]["total_documento"] = normalize_number(total_matches[-1])
+    return rows
+
+
+def odoo_invoice_bundle_rows(text: str) -> list[dict]:
+    """Separate a PDF containing many consecutive Odoo invoices by page."""
+    pages = re.split(r"\f", text)
+    grouped: list[list[str]] = []
+    current_invoice = ""
+    for page in pages:
+        header = re.search(r"No\.?:\s*(001-100-\d{9})", page, re.I)
+        invoice_number = header.group(1) if header else current_invoice
+        if header and invoice_number != current_invoice:
+            grouped.append([page])
+            current_invoice = invoice_number
+        elif grouped:
+            grouped[-1].append(page)
+        elif page.strip():
+            grouped.append([page])
+    rows: list[dict] = []
+    for pages_for_invoice in grouped:
+        invoice_text = "\n".join(pages_for_invoice)
+        number_match = re.search(r"No\.?:\s*(001-100-\d{9})", invoice_text, re.I)
+        invoice_number = number_match.group(1) if number_match else ""
+        parsed = odoo_invoice_rows(invoice_text, invoice_oc(invoice_text))
+        for line_number, row in enumerate(parsed, start=1):
+            row["factura_numero"] = invoice_number
+            row["linea_factura"] = line_number
+        rows.extend(parsed)
     return rows
 
 
@@ -493,7 +537,7 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
                     or rosado_order_rows(text, tables)
                 )
             else:
-                rows = odoo_invoice_rows(text, oc)
+                rows = odoo_invoice_bundle_rows(text) or odoo_invoice_rows(text, oc)
             rows = rows or table_rows(tables, document_type, oc) or text_rows(text, document_type, oc)
             if not rows:
                 warnings.append(f"{uploaded.name}: no se reconocieron líneas de productos.")
@@ -502,9 +546,13 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
                 file_hash = hashlib.sha256(uploaded.read()).hexdigest()
                 uploaded.seek(0)
                 for line_number, row in enumerate(rows, start=1):
-                    row["archivo_hash"] = file_hash
+                    invoice_number = str(row.get("factura_numero", "")).strip()
+                    row["archivo_hash"] = (
+                        hashlib.sha256(f"FACTURA:{invoice_number}".encode("utf-8")).hexdigest()
+                        if invoice_number else file_hash
+                    )
                     row["archivo_nombre"] = uploaded.name
-                    row["linea"] = line_number
+                    row["linea"] = int(row.get("linea_factura", line_number))
             all_rows.extend(rows)
         except Exception as exc:
             warnings.append(f"{uploaded.name}: no se pudo leer ({exc}).")
@@ -516,6 +564,15 @@ def save_invoice_ledger(invoice_rows: pd.DataFrame) -> None:
     if invoice_rows.empty or "archivo_hash" not in invoice_rows:
         return
     with get_engine().begin() as db:
+        # Remove legacy rows previously saved from an individual PDF whose
+        # filename contains the same official invoice number.
+        if "factura_numero" in invoice_rows:
+            for invoice_number in invoice_rows["factura_numero"].dropna().unique():
+                sequence = re.sub(r"\D", "", str(invoice_number))[-9:]
+                if sequence:
+                    db.execute(delete(facturas_acumuladas_table).where(
+                        facturas_acumuladas_table.c.archivo.like(f"%{sequence}%")
+                    ))
         for file_hash in invoice_rows["archivo_hash"].dropna().unique():
             db.execute(delete(facturas_acumuladas_table).where(
                 facturas_acumuladas_table.c.archivo_hash == str(file_hash)
@@ -635,6 +692,26 @@ def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFr
         lambda row: row.codigo_interno or ean_to_internal.get(row.codigo, ""), axis=1
     )
 
+    # If an invoice omits its OC, infer it only when that product appears in
+    # exactly one of the uploaded orders. Ambiguous products remain unmatched
+    # instead of being assigned to the wrong customer order.
+    orders["identity"] = orders.apply(lambda row: row.codigo_interno or row.codigo, axis=1)
+    invoices["identity"] = invoices.apply(lambda row: row.codigo_interno or row.codigo, axis=1)
+    unique_order_oc = (
+        orders[orders["oc"] != ""]
+        .groupby("identity")["oc"]
+        .agg(lambda values: list(dict.fromkeys(values)))
+        .to_dict()
+    )
+    invoices["oc"] = invoices.apply(
+        lambda row: (
+            unique_order_oc[row.identity][0]
+            if not row.oc and len(unique_order_oc.get(row.identity, [])) == 1
+            else row.oc
+        ),
+        axis=1,
+    )
+
     def match_key(row: pd.Series) -> str:
         identity = row.codigo_interno or row.codigo
         return f"{row.oc}|{identity}" if row.oc else identity
@@ -741,8 +818,15 @@ def processing_tab() -> None:
     st.subheader("Procesar Fill Rate")
     st.write("Carga uno o varios pedidos y facturas en PDF. Los resultados se consolidan y guardan en el histórico.")
     left, right = st.columns(2)
-    order_files = left.file_uploader("Pedidos PDF", type=["pdf"], accept_multiple_files=True, key="orders")
-    invoice_files = right.file_uploader("Facturas PDF", type=["pdf"], accept_multiple_files=True, key="invoices")
+    # Some customers deliver valid PDF documents without the .pdf extension
+    # (for example El Rosado). Leaving the extension filter open lets those
+    # files through; pdfplumber still validates their real content on reading.
+    order_files = left.file_uploader(
+        "Pedidos PDF (también sin extensión)", accept_multiple_files=True, key="orders"
+    )
+    invoice_files = right.file_uploader(
+        "Facturas PDF (también sin extensión)", accept_multiple_files=True, key="invoices"
+    )
     meta_left, meta_right = st.columns(2)
     cliente = meta_left.text_input("Cliente (opcional)", placeholder="Ej. Corporación Favorita")
     usuario = meta_right.text_input("Responsable", value=st.session_state.get("username", "Operador"), disabled=True)

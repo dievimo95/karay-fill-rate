@@ -1,6 +1,12 @@
-# Karay Fill Rate 2.2
+# Karay Fill Rate 2.5
 
 Aplicación Streamlit para cargar varios pedidos y facturas PDF, consolidarlos por orden de compra y código de producto, calcular el Fill Rate y la venta dejada de facturar, y conservar cada procesamiento en SQLite.
+
+La versión 2.3 reconoce cantidades con separadores de miles y muestra por separado la venta facturada antes de IVA y el total de las facturas con IVA.
+
+La versión 2.4 agrega un dashboard mensual de Forecast por unidades. Permite cargar o reemplazar archivos Excel, CSV o TXT, acumula las facturas procesadas sin duplicarlas y muestra forecast, facturado, pendiente, cumplimiento, excedentes y productos sin coincidencia.
+
+La versión 2.5 amplía la lectura de pedidos para los formatos reales de Corporación Favorita, Casa Deli/Odoo, Coral (Gerardo Ortiz), Tía y Corporación El Rosado. El cruce admite tanto código interno como código de barras.
 
 ## Qué incluye
 
@@ -10,6 +16,7 @@ Aplicación Streamlit para cargar varios pedidos y facturas PDF, consolidarlos p
 - Venta potencial, venta facturada y venta dejada de facturar.
 - Guardado automático y sin duplicados en `fillrate.db`.
 - Histórico con filtros, detalle y descarga CSV.
+- Forecast mensual por unidades con avance por producto y descarga CSV.
 - Inicio de sesión configurable para Diego y su asistente.
 - Compatibilidad con PostgreSQL para conservar el Histórico en Internet.
 - Preparada para publicar en Streamlit Community Cloud.
@@ -69,6 +76,8 @@ Sin configuración de Secrets, la aplicación continúa funcionando localmente c
 El lector intenta reconocer tablas con columnas equivalentes a código/EAN, descripción, cantidad, precio unitario y OC. También incluye un lector alternativo para pedidos de Corporación Favorita y facturas electrónicas en las que código, descripción y cantidad aparecen como texto.
 
 En los pedidos de Corporación Favorita, la cantidad en cajas se convierte automáticamente a unidades mediante la columna `UC`. Las OCs separadas que aparezcan dentro de un mismo PDF se conservan individualmente.
+
+En los pedidos de Corporación El Rosado, las unidades se calculan como `UXC × CANTIDAD`; por ejemplo, 15 unidades por caja × 21 cajas equivalen a 315 unidades pedidas. En los pedidos de Tía se usa directamente la columna de cantidad en unidades.
 
 Si un proveedor cambia el diseño del PDF, la aplicación mostrará el nombre del archivo que no pudo interpretar. Los PDFs escaneados como imagen requieren OCR y no se procesan en esta versión.
 
