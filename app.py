@@ -246,7 +246,9 @@ def find_context(text: str) -> tuple[str, str]:
 def invoice_oc(text: str) -> str:
     """Return numeric or alphanumeric OC printed in an invoice footer."""
     explicit = re.search(
-        r"\bOC\s*:\s*((?:[A-Z]{1,3}\s*)?\d(?:[A-Z0-9 ]{3,18}\d))",
+        # El Rosado prints the destination between OC and the number, for
+        # example "OC GYE: 5401477656" or "OC UIO: 5401477656".
+        r"\bOC(?:\s+(?:GYE|UIO))?\s*:\s*((?:[A-Z]{1,3}\s*)?\d(?:[A-Z0-9 ]{3,18}\d))",
         text,
         re.I,
     )
@@ -270,6 +272,21 @@ def known_customer(text: str) -> str:
             (r"CORPORACION EL ROSADO", "Corporación El Rosado"),
         ) if re.search(marker, text, re.I)
     ), "")
+
+
+def excluded_product(row: dict | pd.Series) -> bool:
+    """Products discontinued by the business and excluded from every KPI."""
+    product = re.sub(r"\s+", " ", str(row.get("producto", ""))).upper()
+    codes = {
+        re.sub(r"\D", "", str(row.get("codigo", ""))),
+        re.sub(r"\D", "", str(row.get("codigo_interno", ""))),
+    }
+    # Aceite de Coco 270 ml Sunshine (El Rosado).  The customer order can
+    # expose either its internal reference or its article number.
+    return (
+        "SUNSHINE" in product
+        or bool(codes & {"1140001", "01140001", "40633856", "000000000040633856"})
+    )
 
 
 def favorita_order_rows(text: str) -> list[dict]:
@@ -394,12 +411,49 @@ def tia_order_rows(text: str, tables: Iterable[list[list[str | None]]]) -> list[
         header_index = next((i for i, row in enumerate(table) if "CCAANNTT ((UUNNIIDD))" in str((row or [""])[0] or "")), None)
         if header_index is None:
             continue
+
+        # TIA has changed the physical position of some columns between PDF
+        # versions. The headings in these files duplicate every character
+        # (for example EESSTTAADDÍÍSSTTIICCOO), so collapse those duplicates
+        # and locate the fields by heading instead of relying on fixed indexes.
+        def tia_heading(value: object) -> str:
+            heading = re.sub(r"\s+", " ", str(value or "")).upper()
+            return re.sub(r"(.)\1", r"\1", heading)
+
+        headers = [tia_heading(cell) for cell in table[header_index]]
+        quantity_index = next(
+            (i for i, heading in enumerate(headers) if "CANT" in heading and "UNID" in heading), 0
+        )
+        product_index = next(
+            (i for i, heading in enumerate(headers) if "DESCRIP" in heading), 6
+        )
+        statistic_index = next(
+            (i for i, heading in enumerate(headers) if "ESTAD" in heading), None
+        )
+        price_index = next(
+            (i for i, heading in enumerate(headers) if "COSTO" in heading and "UNIT" in heading), None
+        )
         for cells in table[header_index + 1:]:
-            if not cells or not re.fullmatch(r"\d+(?:[.,]\d+)?", str(cells[0] or "").strip()):
+            if not cells:
                 continue
-            quantity = normalize_number(cells[0])
-            client_code = re.sub(r"\D", "", str(cells[10] or "")) if len(cells) > 10 else ""
-            product = str(cells[6] or "").replace("\n", " ").strip() if len(cells) > 6 else ""
+            cells = list(cells)
+            quantity_value = cells[quantity_index] if quantity_index < len(cells) else ""
+            if not re.fullmatch(r"\d+(?:[.,]\d+)?", str(quantity_value or "").strip()):
+                continue
+            quantity = normalize_number(quantity_value)
+            statistic_value = cells[statistic_index] if statistic_index is not None and statistic_index < len(cells) else ""
+            client_code = re.sub(r"\D", "", str(statistic_value or ""))
+            # Last-resort scan for older/newer layouts whose extracted heading
+            # is blank but whose product row still contains one 9-digit code.
+            if len(client_code) != 9:
+                client_code = next((
+                    digits for cell in cells
+                    if len((digits := re.sub(r"\D", "", str(cell or "")))) == 9
+                ), "")
+            product = (
+                str(cells[product_index] or "").replace("\n", " ").strip()
+                if product_index < len(cells) else ""
+            )
             # Ignore homologation/footer tables that happen to begin with a
             # numeric code but are not actual ordered product lines.
             if len(client_code) != 9 or not product:
@@ -411,7 +465,9 @@ def tia_order_rows(text: str, tables: Iterable[list[list[str | None]]]) -> list[
                 "codigo": ean or internal or client_code,
                 "producto": product,
                 "cantidad": quantity,
-                "precio": normalize_number(cells[11] if len(cells) > 11 else 0),
+                "precio": normalize_number(
+                    cells[price_index] if price_index is not None and price_index < len(cells) else 0
+                ),
                 "tipo": "pedido",
             })
     return rows
@@ -632,6 +688,7 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
             else:
                 rows = odoo_invoice_bundle_rows(text) or odoo_invoice_rows(text, oc)
             rows = rows or table_rows(tables, document_type, oc) or text_rows(text, document_type, oc)
+            rows = [row for row in rows if not excluded_product(row)]
             if document_type == "pedido":
                 detected_order_client = known_customer(text) or client or "Cliente sin identificar"
                 for row in rows:
@@ -1319,6 +1376,10 @@ def forecast_tab() -> None:
                 cargas_table.c.linea_negocio == indicator_line,
             ), db,
         )
+    if not order_detail.empty:
+        order_detail = order_detail[
+            ~order_detail.apply(excluded_product, axis=1)
+        ].reset_index(drop=True)
 
     # Relate order codes to the internal forecast code using either COD or EAN.
     internal_codes = set(forecast_rows["codigo_interno"].astype(str))
