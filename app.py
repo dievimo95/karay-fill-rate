@@ -1310,6 +1310,9 @@ def forecast_tab() -> None:
                 detalle_table.c.producto,
                 detalle_table.c.pedidas,
                 detalle_table.c.facturadas,
+                detalle_table.c.venta_potencial,
+                detalle_table.c.venta_facturada,
+                detalle_table.c.venta_perdida,
             ).select_from(detalle_table.join(cargas_table, detalle_table.c.carga_id == cargas_table.c.id)).where(
                 cargas_table.c.fecha >= start_dt,
                 cargas_table.c.fecha < end_dt,
@@ -1352,25 +1355,74 @@ def forecast_tab() -> None:
             cards[3].metric("Fill Rate general", f"{fill_rate:.1f}%")
             st.progress(min(max(fill_rate / 100, 0.0), 1.0))
 
+            st.markdown("#### Cumplimiento en dólares")
+            potential_sales = float(order_detail["venta_potencial"].sum())
+            billed_sales = float(order_detail["venta_facturada"].sum())
+            missed_sales = max(potential_sales - billed_sales, 0.0)
+            value_fill_rate = 100 * billed_sales / potential_sales if potential_sales else 0.0
+            value_cards = st.columns(4)
+            value_cards[0].metric("Venta potencial", f"${potential_sales:,.2f}")
+            value_cards[1].metric("Venta facturada", f"${billed_sales:,.2f}")
+            value_cards[2].metric("Venta dejada de facturar", f"${missed_sales:,.2f}")
+            value_cards[3].metric("Fill Rate en dólares", f"{value_fill_rate:.1f}%")
+            st.progress(min(max(value_fill_rate / 100, 0.0), 1.0))
+
             by_customer = order_detail.groupby("cliente", as_index=False).agg(
-                pedidas=("pedidas", "sum"), entregadas=("facturadas", "sum")
+                pedidas=("pedidas", "sum"),
+                entregadas=("facturadas", "sum"),
+                venta_potencial=("venta_potencial", "sum"),
+                venta_facturada=("venta_facturada", "sum"),
             )
             by_customer["pendientes"] = (by_customer["pedidas"] - by_customer["entregadas"]).clip(lower=0)
             by_customer["fill_rate"] = by_customer.apply(
                 lambda row: 100 * row.entregadas / row.pedidas if row.pedidas else 0.0, axis=1
             )
+            by_customer["venta_pendiente"] = (
+                by_customer["venta_potencial"] - by_customer["venta_facturada"]
+            ).clip(lower=0)
+            by_customer["fill_rate_dolares"] = by_customer.apply(
+                lambda row: 100 * row.venta_facturada / row.venta_potencial
+                if row.venta_potencial else 0.0,
+                axis=1,
+            )
             by_product = order_detail.groupby(
                 ["codigo_interno", "producto"], as_index=False
-            ).agg(pedidas=("pedidas", "sum"), entregadas=("facturadas", "sum"))
+            ).agg(
+                pedidas=("pedidas", "sum"),
+                entregadas=("facturadas", "sum"),
+                venta_potencial=("venta_potencial", "sum"),
+                venta_facturada=("venta_facturada", "sum"),
+            )
             by_product["pendientes"] = (by_product["pedidas"] - by_product["entregadas"]).clip(lower=0)
             by_product["fill_rate"] = by_product.apply(
                 lambda row: 100 * row.entregadas / row.pedidas if row.pedidas else 0.0, axis=1
             )
+            by_product["venta_pendiente"] = (
+                by_product["venta_potencial"] - by_product["venta_facturada"]
+            ).clip(lower=0)
+            by_product["fill_rate_dolares"] = by_product.apply(
+                lambda row: 100 * row.venta_facturada / row.venta_potencial
+                if row.venta_potencial else 0.0,
+                axis=1,
+            )
+            money_columns = {
+                "venta_potencial": st.column_config.NumberColumn("Venta potencial", format="$%.2f"),
+                "venta_facturada": st.column_config.NumberColumn("Venta facturada", format="$%.2f"),
+                "venta_pendiente": st.column_config.NumberColumn("Venta pendiente", format="$%.2f"),
+                "fill_rate": st.column_config.NumberColumn("Fill Rate unidades", format="%.1f%%"),
+                "fill_rate_dolares": st.column_config.NumberColumn("Fill Rate dólares", format="%.1f%%"),
+            }
             left, right = st.columns(2)
             left.markdown("##### Resultado por cliente")
-            left.dataframe(by_customer.sort_values("fill_rate"), width="stretch", hide_index=True)
+            left.dataframe(
+                by_customer.sort_values("fill_rate"), width="stretch", hide_index=True,
+                column_config=money_columns,
+            )
             right.markdown("##### Resultado por producto")
-            right.dataframe(by_product.sort_values("fill_rate"), width="stretch", hide_index=True)
+            right.dataframe(
+                by_product.sort_values("fill_rate"), width="stretch", hide_index=True,
+                column_config=money_columns,
+            )
 
     with production_tab:
         st.markdown("#### Producción destinada al forecast vs. forecast")
