@@ -79,6 +79,23 @@ forecast_detalle_table = Table(
     Column("unidades", Float, nullable=False),
     UniqueConstraint("forecast_id", "codigo_interno", name="uq_forecast_producto"),
 )
+produccion_table = Table(
+    "produccion", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("periodo", String(7), nullable=False, unique=True),
+    Column("archivo", String(255), nullable=False, default=""),
+    Column("actualizado", DateTime, nullable=False),
+)
+produccion_detalle_table = Table(
+    "produccion_detalle", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("produccion_id", Integer, ForeignKey("produccion.id", ondelete="CASCADE"), nullable=False),
+    Column("codigo_interno", String(20), nullable=False),
+    Column("ean", String(20), nullable=False, default=""),
+    Column("producto", Text, nullable=False, default=""),
+    Column("unidades", Float, nullable=False),
+    UniqueConstraint("produccion_id", "codigo_interno", name="uq_produccion_producto"),
+)
 facturas_acumuladas_table = Table(
     "facturas_acumuladas", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
@@ -93,6 +110,7 @@ facturas_acumuladas_table = Table(
     UniqueConstraint("archivo_hash", "linea", name="uq_factura_archivo_linea"),
 )
 Index("idx_forecast_periodo", forecast_table.c.periodo)
+Index("idx_produccion_periodo", produccion_table.c.periodo)
 Index("idx_facturas_fecha", facturas_acumuladas_table.c.fecha_documento)
 Index("idx_facturas_codigo", facturas_acumuladas_table.c.codigo_interno)
 
@@ -685,6 +703,38 @@ def save_forecast(period: str, uploaded_file, forecast_rows: pd.DataFrame) -> in
     return forecast_id
 
 
+def save_production(period: str, uploaded_file, production_rows: pd.DataFrame) -> int:
+    """Save or replace the production assigned to a monthly forecast."""
+    with get_engine().begin() as db:
+        existing = db.execute(
+            select(produccion_table.c.id).where(produccion_table.c.periodo == period)
+        ).first()
+        if existing:
+            production_id = int(existing.id)
+            db.execute(update(produccion_table).where(produccion_table.c.id == production_id).values(
+                archivo=uploaded_file.name, actualizado=datetime.now()
+            ))
+            db.execute(delete(produccion_detalle_table).where(
+                produccion_detalle_table.c.produccion_id == production_id
+            ))
+        else:
+            created = db.execute(insert(produccion_table).values(
+                periodo=period, archivo=uploaded_file.name, actualizado=datetime.now()
+            ))
+            production_id = int(created.inserted_primary_key[0])
+        db.execute(insert(produccion_detalle_table), [
+            {
+                "produccion_id": production_id,
+                "codigo_interno": str(row.codigo_interno),
+                "ean": str(row.ean),
+                "producto": str(row.producto),
+                "unidades": float(row.unidades),
+            }
+            for row in production_rows.itertuples(index=False)
+        ])
+    return production_id
+
+
 def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFrame:
     if order_rows.empty:
         raise ValueError("No se encontraron líneas válidas en los pedidos.")
@@ -1045,39 +1095,46 @@ def history_tab() -> None:
 
 
 def forecast_tab() -> None:
-    st.subheader("Indicadores")
-    st.write("Carga el forecast del mes y compáralo con todas las facturas procesadas, sin duplicar archivos.")
-    upload_left, upload_right = st.columns([2, 1])
-    forecast_file = upload_left.file_uploader(
-        "Forecast Excel, CSV o TXT", type=["xlsx", "xls", "csv", "txt"], key="forecast_file"
-    )
-    month_value = upload_right.date_input("Mes del forecast", value=date.today().replace(day=1), key="forecast_month")
-    if st.button("Guardar o reemplazar forecast", type="primary", width="stretch"):
-        if forecast_file is None:
-            st.error("Selecciona el archivo del forecast.")
-        else:
-            try:
-                forecast_rows = forecast_dataframe(forecast_file)
-                period = month_value.strftime("%Y-%m")
-                save_forecast(period, forecast_file, forecast_rows)
-                st.success(
-                    f"Forecast {period} guardado: {len(forecast_rows)} productos y "
-                    f"{forecast_rows['unidades'].sum():,.1f} unidades."
-                )
-            except Exception as exc:
-                st.error(f"No se pudo cargar el forecast: {exc}")
+    st.subheader("📊 Indicadores")
+    st.write("Control mensual por unidades: pedidos, entregas, producción y forecast.")
+
+    with st.expander("⚙️ Cargar o reemplazar forecast", expanded=False):
+        upload_left, upload_right = st.columns([2, 1])
+        forecast_file = upload_left.file_uploader(
+            "Forecast Excel, CSV o TXT", type=["xlsx", "xls", "csv", "txt"], key="forecast_file"
+        )
+        month_value = upload_right.date_input(
+            "Mes del forecast", value=date.today().replace(day=1), key="forecast_month"
+        )
+        if st.button("Guardar o reemplazar forecast", type="primary", width="stretch"):
+            if forecast_file is None:
+                st.error("Selecciona el archivo del forecast.")
+            else:
+                try:
+                    rows = forecast_dataframe(forecast_file)
+                    period = month_value.strftime("%Y-%m")
+                    save_forecast(period, forecast_file, rows)
+                    st.success(
+                        f"Forecast {period} guardado: {len(rows)} productos y "
+                        f"{rows['unidades'].sum():,.0f} unidades."
+                    )
+                except Exception as exc:
+                    st.error(f"No se pudo cargar el forecast: {exc}")
 
     with get_engine().connect() as db:
         available = pd.read_sql(select(forecast_table).order_by(forecast_table.c.periodo.desc()), db)
     if available.empty:
-        st.info("Carga el primer forecast para ver el avance mensual.")
+        st.info("Carga el primer forecast para habilitar los indicadores.")
         return
 
-    selected_period = st.selectbox("Periodo", available["periodo"].tolist(), key="forecast_period")
+    selected_period = st.selectbox("Periodo de análisis", available["periodo"].tolist(), key="indicator_period")
     forecast_id = int(available.loc[available["periodo"] == selected_period, "id"].iloc[0])
     year, month = map(int, selected_period.split("-"))
     period_start = date(year, month, 1)
     period_end = date(year + (month == 12), 1 if month == 12 else month + 1, 1)
+    start_dt = datetime.combine(period_start, datetime.min.time())
+    end_dt = datetime.combine(period_end, datetime.min.time())
+
     with get_engine().connect() as db:
         forecast_rows = pd.read_sql(
             select(
@@ -1087,81 +1144,173 @@ def forecast_tab() -> None:
                 forecast_detalle_table.c.unidades.label("forecast"),
             ).where(forecast_detalle_table.c.forecast_id == forecast_id), db,
         )
-        invoices = pd.read_sql(
+        order_detail = pd.read_sql(
             select(
-                facturas_acumuladas_table.c.codigo_interno,
-                facturas_acumuladas_table.c.ean,
-                facturas_acumuladas_table.c.producto,
-                facturas_acumuladas_table.c.unidades,
-            ).where(
-                facturas_acumuladas_table.c.fecha_documento >= period_start,
-                facturas_acumuladas_table.c.fecha_documento < period_end,
+                cargas_table.c.cliente,
+                detalle_table.c.codigo,
+                detalle_table.c.producto,
+                detalle_table.c.pedidas,
+                detalle_table.c.facturadas,
+            ).select_from(detalle_table.join(cargas_table, detalle_table.c.carga_id == cargas_table.c.id)).where(
+                cargas_table.c.fecha >= start_dt,
+                cargas_table.c.fecha < end_dt,
             ), db,
         )
-    if invoices.empty:
-        billed = pd.DataFrame(columns=["codigo_interno", "facturado"])
-    else:
-        billed = invoices.groupby("codigo_interno", as_index=False)["unidades"].sum().rename(
-            columns={"unidades": "facturado"}
+
+    # Relate order codes to the internal forecast code using either COD or EAN.
+    internal_codes = set(forecast_rows["codigo_interno"].astype(str))
+    ean_to_internal = {
+        str(row.ean): str(row.codigo_interno)
+        for row in forecast_rows.itertuples(index=False) if str(row.ean).strip()
+    }
+    if not order_detail.empty:
+        def indicator_code(value: object) -> str:
+            digits = re.sub(r"\D", "", str(value or ""))
+            internal = digits.zfill(8) if digits and len(digits) <= 8 else digits
+            if internal in internal_codes:
+                return internal
+            return ean_to_internal.get(digits, internal)
+        order_detail["codigo_interno"] = order_detail["codigo"].map(indicator_code)
+
+    fill_tab, production_tab, accuracy_tab = st.tabs([
+        "🚚 Fill Rate", "🏭 Nivel de Servicio de Producción", "🎯 Exactitud del Forecast"
+    ])
+
+    with fill_tab:
+        st.markdown("#### Pedidas vs. entregadas")
+        if order_detail.empty:
+            st.warning("No hay pedidos guardados en este periodo.")
+        else:
+            requested = float(order_detail["pedidas"].sum())
+            delivered = float(order_detail["facturadas"].sum())
+            pending = max(requested - delivered, 0.0)
+            fill_rate = 100 * delivered / requested if requested else 0.0
+            cards = st.columns(4)
+            cards[0].metric("Unidades pedidas", f"{requested:,.0f}")
+            cards[1].metric("Unidades entregadas", f"{delivered:,.0f}")
+            cards[2].metric("Unidades pendientes", f"{pending:,.0f}")
+            cards[3].metric("Fill Rate general", f"{fill_rate:.1f}%")
+            st.progress(min(max(fill_rate / 100, 0.0), 1.0))
+
+            by_customer = order_detail.groupby("cliente", as_index=False).agg(
+                pedidas=("pedidas", "sum"), entregadas=("facturadas", "sum")
+            )
+            by_customer["pendientes"] = (by_customer["pedidas"] - by_customer["entregadas"]).clip(lower=0)
+            by_customer["fill_rate"] = by_customer.apply(
+                lambda row: 100 * row.entregadas / row.pedidas if row.pedidas else 0.0, axis=1
+            )
+            by_product = order_detail.groupby(
+                ["codigo_interno", "producto"], as_index=False
+            ).agg(pedidas=("pedidas", "sum"), entregadas=("facturadas", "sum"))
+            by_product["pendientes"] = (by_product["pedidas"] - by_product["entregadas"]).clip(lower=0)
+            by_product["fill_rate"] = by_product.apply(
+                lambda row: 100 * row.entregadas / row.pedidas if row.pedidas else 0.0, axis=1
+            )
+            left, right = st.columns(2)
+            left.markdown("##### Resultado por cliente")
+            left.dataframe(by_customer.sort_values("fill_rate"), width="stretch", hide_index=True)
+            right.markdown("##### Resultado por producto")
+            right.dataframe(by_product.sort_values("fill_rate"), width="stretch", hide_index=True)
+
+    with production_tab:
+        st.markdown("#### Producción destinada al forecast vs. forecast")
+        production_file = st.file_uploader(
+            "Producción del mes (columnas COD y Unidades)",
+            type=["xlsx", "xls", "csv", "txt"], key=f"production_{selected_period}"
         )
-    report = forecast_rows.merge(billed, on="codigo_interno", how="left")
-    report["facturado"] = report["facturado"].fillna(0.0)
-    report["pendiente"] = (report["forecast"] - report["facturado"]).clip(lower=0)
-    report["excedente"] = (report["facturado"] - report["forecast"]).clip(lower=0)
-    report["cumplimiento"] = report.apply(
-        lambda row: 100 * row.facturado / row.forecast if row.forecast > 0 else (100 if row.facturado > 0 else 0),
-        axis=1,
-    )
-    forecast_total = float(report["forecast"].sum())
-    billed_total = float(report["facturado"].sum())
-    pending_total = float(report["pendiente"].sum())
-    achievement = 100 * billed_total / forecast_total if forecast_total else 0.0
-    unmatched_units = 0.0
-    if not invoices.empty:
-        forecast_codes = set(report["codigo_interno"])
-        unmatched_units = float(invoices.loc[~invoices["codigo_interno"].isin(forecast_codes), "unidades"].sum())
+        if st.button("Guardar o reemplazar producción", type="primary", key="save_production"):
+            if production_file is None:
+                st.error("Selecciona el archivo de producción.")
+            else:
+                try:
+                    production_rows = forecast_dataframe(production_file)
+                    save_production(selected_period, production_file, production_rows)
+                    st.success(
+                        f"Producción {selected_period} guardada: "
+                        f"{production_rows['unidades'].sum():,.0f} unidades."
+                    )
+                except Exception as exc:
+                    st.error(f"No se pudo cargar la producción: {exc}")
 
-    metrics = st.columns(5)
-    metrics[0].metric("Forecast", f"{forecast_total:,.1f}")
-    metrics[1].metric("Facturado acumulado", f"{billed_total:,.1f}")
-    metrics[2].metric("Pendiente", f"{pending_total:,.1f}")
-    metrics[3].metric("Cumplimiento", f"{achievement:.1f}%")
-    metrics[4].metric("Sin coincidencia", f"{unmatched_units:,.1f}")
-    st.progress(min(max(achievement / 100, 0.0), 1.0), text=f"Avance de {selected_period}: {achievement:.1f}%")
-    if invoices.empty:
-        st.warning("Aún no hay facturas acumuladas para este mes. Vuelve a procesarlas una vez para alimentar el forecast.")
-    if unmatched_units:
-        st.warning(f"Hay {unmatched_units:,.1f} unidades facturadas cuyos códigos no aparecen en este forecast.")
+        with get_engine().connect() as db:
+            production_header = db.execute(
+                select(produccion_table.c.id).where(produccion_table.c.periodo == selected_period)
+            ).first()
+            if production_header:
+                produced = pd.read_sql(
+                    select(
+                        produccion_detalle_table.c.codigo_interno,
+                        produccion_detalle_table.c.unidades.label("producido"),
+                    ).where(produccion_detalle_table.c.produccion_id == int(production_header.id)), db,
+                )
+            else:
+                produced = pd.DataFrame(columns=["codigo_interno", "producido"])
 
-    status = st.selectbox("Mostrar", ["Todos", "Pendientes", "Cumplidos", "Sobrecumplidos"])
-    visible = report.copy()
-    if status == "Pendientes":
-        visible = visible[visible["pendiente"] > 0]
-    elif status == "Cumplidos":
-        visible = visible[(visible["pendiente"] == 0) & (visible["excedente"] == 0)]
-    elif status == "Sobrecumplidos":
-        visible = visible[visible["excedente"] > 0]
-    display_columns = [
-        "codigo_interno", "producto", "forecast", "facturado", "pendiente", "excedente", "cumplimiento"
-    ]
-    st.dataframe(visible[display_columns].sort_values("pendiente", ascending=False), width="stretch", hide_index=True,
-        column_config={
-            "codigo_interno": "COD",
-            "producto": "Producto",
-            "forecast": st.column_config.NumberColumn("Forecast", format="%.1f"),
-            "facturado": st.column_config.NumberColumn("Facturado", format="%.1f"),
-            "pendiente": st.column_config.NumberColumn("Pendiente", format="%.1f"),
-            "excedente": st.column_config.NumberColumn("Excedente", format="%.1f"),
-            "cumplimiento": st.column_config.NumberColumn("Cumplimiento", format="%.1f%%"),
-        })
-    chart = report.nlargest(15, "pendiente")[["producto", "pendiente"]].set_index("producto")
-    if not chart.empty and chart["pendiente"].sum() > 0:
-        st.caption("15 productos con mayor saldo pendiente")
-        st.bar_chart(chart)
-    st.download_button(
-        "Descargar avance CSV", report[display_columns].to_csv(index=False).encode("utf-8-sig"),
-        f"forecast_{selected_period}.csv", "text/csv",
-    )
+        production_report = forecast_rows.merge(produced, on="codigo_interno", how="left")
+        production_report["producido"] = production_report["producido"].fillna(0.0)
+        production_report["pendiente_producir"] = (
+            production_report["forecast"] - production_report["producido"]
+        ).clip(lower=0)
+        production_report["excedente"] = (
+            production_report["producido"] - production_report["forecast"]
+        ).clip(lower=0)
+        production_report["nivel_servicio"] = production_report.apply(
+            lambda row: 100 * row.producido / row.forecast if row.forecast else 0.0, axis=1
+        )
+        forecast_total = float(production_report["forecast"].sum())
+        produced_total = float(production_report["producido"].sum())
+        service = 100 * produced_total / forecast_total if forecast_total else 0.0
+        p_cards = st.columns(5)
+        p_cards[0].metric("Forecast", f"{forecast_total:,.0f}")
+        p_cards[1].metric("Producido", f"{produced_total:,.0f}")
+        p_cards[2].metric("Pendiente de producir", f"{production_report['pendiente_producir'].sum():,.0f}")
+        p_cards[3].metric("Excedente", f"{production_report['excedente'].sum():,.0f}")
+        p_cards[4].metric("Nivel de servicio", f"{service:.1f}%")
+        if produced.empty:
+            st.info("Carga la producción del mes para calcular este indicador.")
+        st.dataframe(
+            production_report[["codigo_interno", "producto", "forecast", "producido", "pendiente_producir", "excedente", "nivel_servicio"]]
+            .sort_values("pendiente_producir", ascending=False), width="stretch", hide_index=True
+        )
+
+    with accuracy_tab:
+        st.markdown("#### Forecast vs. pedidos reales")
+        if order_detail.empty:
+            st.warning("No hay pedidos reales guardados en este periodo.")
+        else:
+            real_orders = order_detail.groupby("codigo_interno", as_index=False)["pedidas"].sum().rename(
+                columns={"pedidas": "pedido_real"}
+            )
+            accuracy = forecast_rows.merge(real_orders, on="codigo_interno", how="left")
+            accuracy["pedido_real"] = accuracy["pedido_real"].fillna(0.0)
+            accuracy["diferencia"] = accuracy["forecast"] - accuracy["pedido_real"]
+            accuracy["sesgo"] = accuracy["diferencia"].apply(
+                lambda value: "Sobreestimación" if value > 0 else ("Subestimación" if value < 0 else "Exacto")
+            )
+            accuracy["exactitud"] = accuracy.apply(
+                lambda row: max(0.0, 100 * (1 - abs(row.pedido_real - row.forecast) / row.pedido_real))
+                if row.pedido_real > 0 else (100.0 if row.forecast == 0 else 0.0), axis=1
+            )
+            forecast_total = float(accuracy["forecast"].sum())
+            real_total = float(accuracy["pedido_real"].sum())
+            general_accuracy = max(0.0, 100 * (1 - abs(real_total - forecast_total) / real_total)) if real_total else 0.0
+            over = float(accuracy.loc[accuracy["diferencia"] > 0, "diferencia"].sum())
+            under = float((-accuracy.loc[accuracy["diferencia"] < 0, "diferencia"]).sum())
+            a_cards = st.columns(5)
+            a_cards[0].metric("Forecast", f"{forecast_total:,.0f}")
+            a_cards[1].metric("Pedido real", f"{real_total:,.0f}")
+            a_cards[2].metric("Exactitud general", f"{general_accuracy:.1f}%")
+            a_cards[3].metric("Sobreestimación", f"{over:,.0f}")
+            a_cards[4].metric("Subestimación", f"{under:,.0f}")
+            st.dataframe(
+                accuracy[["codigo_interno", "producto", "forecast", "pedido_real", "diferencia", "sesgo", "exactitud"]]
+                .sort_values("exactitud"), width="stretch", hide_index=True
+            )
+            st.download_button(
+                "Descargar exactitud CSV",
+                accuracy.to_csv(index=False).encode("utf-8-sig"),
+                f"exactitud_forecast_{selected_period}.csv", "text/csv",
+            )
 
 
 def configured_users() -> dict[str, str]:
