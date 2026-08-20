@@ -1077,29 +1077,6 @@ def history_tab() -> None:
     with get_engine().connect() as db:
         history = pd.read_sql(select(cargas_table).order_by(cargas_table.c.fecha.desc()), db)
 
-    with st.expander("Administrar datos cargados"):
-        st.warning(
-            "Esta opción elimina el Histórico, sus detalles y las facturas acumuladas. "
-            "El Forecast inicial y sus cantidades se conservarán."
-        )
-        confirmed = st.checkbox(
-            "Confirmo que deseo borrar los datos de prueba y conservar el Forecast",
-            key="confirm_clear_operational_data",
-        )
-        if st.button(
-            "Borrar datos de prueba",
-            type="primary",
-            disabled=not confirmed,
-            key="clear_operational_data",
-        ):
-            clear_operational_data()
-            st.session_state.pop("last_result", None)
-            st.session_state.pop("pending_result", None)
-            st.success(
-                "Datos de prueba eliminados. El Forecast inicial y sus unidades permanecen intactos."
-            )
-            st.stop()
-
     if history.empty:
         st.info("Todavía no hay procesamientos guardados.")
         return
@@ -1121,7 +1098,16 @@ def history_tab() -> None:
     })
     if filtered.empty:
         return
-    selected = st.selectbox("Ver detalle del procesamiento", filtered["id"].tolist(), format_func=lambda x: f"Procesamiento #{x}")
+    selected = st.selectbox(
+        "Ver detalle del procesamiento",
+        [None, *filtered["id"].tolist()],
+        format_func=lambda x: "Selecciona una carga" if x is None else f"Procesamiento #{x}",
+        index=0,
+        key="selected_history_run",
+    )
+    if selected is None:
+        st.info("Selecciona una carga para ver su detalle o eliminarla individualmente.")
+        return
     selected_row = history.loc[history["id"] == int(selected)].iloc[0]
     try:
         selected_orders = json.loads(selected_row.get("nombres_pedidos") or "[]")
@@ -1133,6 +1119,11 @@ def history_tab() -> None:
         selected_invoices = []
 
     with st.expander("✏️ Modificar o eliminar esta carga"):
+        st.error(
+            f"Se eliminará únicamente el procesamiento #{selected}, del "
+            f"{pd.to_datetime(selected_row['fecha']).strftime('%d/%m/%Y %H:%M')}, "
+            f"cliente {selected_row.get('cliente') or 'sin cliente'}."
+        )
         st.write(
             "Elimina este procesamiento para corregir sus archivos y volverlos a cargar desde "
             "**📦 Procesar pedidos**. También se retirarán sus facturas del acumulado de indicadores."
@@ -1142,14 +1133,15 @@ def history_tab() -> None:
         files_left.write("\n".join(f"• {name}" for name in selected_orders) or "Sin archivos registrados")
         files_right.caption("Facturas de esta carga")
         files_right.write("\n".join(f"• {name}" for name in selected_invoices) or "Sin archivos registrados")
-        delete_confirmed = st.checkbox(
-            f"Confirmo que deseo eliminar el procesamiento #{selected}",
+        confirmation_id = st.text_input(
+            f"Para confirmar, escribe el número {selected}",
             key=f"confirm_delete_run_{selected}",
+            placeholder=str(selected),
         )
         if st.button(
-            "Eliminar procesamiento seleccionado",
+            f"Eliminar solamente el procesamiento #{selected}",
             type="primary",
-            disabled=not delete_confirmed,
+            disabled=confirmation_id.strip() != str(selected),
             key=f"delete_run_{selected}",
         ):
             delete_saved_run(int(selected))
