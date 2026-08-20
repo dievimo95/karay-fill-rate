@@ -1045,7 +1045,7 @@ def history_tab() -> None:
 
 
 def forecast_tab() -> None:
-    st.subheader("Fill Rate Interno")
+    st.subheader("Indicadores")
     st.write("Carga el forecast del mes y compáralo con todas las facturas procesadas, sin duplicar archivos.")
     upload_left, upload_right = st.columns([2, 1])
     forecast_file = upload_left.file_uploader(
@@ -1207,7 +1207,7 @@ def main() -> None:
         return
     init_database()
     st.title("📦 Karay Fill Rate")
-    process, history, forecast = st.tabs(["📤 Procesar", "📚 Histórico", "📈 Fill Rate Interno"])
+    process, history, forecast = st.tabs(["📦 Procesar pedidos", "🕘 Histórico", "📊 Indicadores"])
     with process:
         processing_tab()
     with history:
