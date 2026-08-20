@@ -859,6 +859,44 @@ def clear_operational_data() -> None:
         db.execute(delete(facturas_acumuladas_table))
 
 
+def delete_saved_run(run_id: int) -> tuple[list[str], list[str]]:
+    """Delete one saved run and its unreferenced invoices from the monthly ledger."""
+    with get_engine().begin() as db:
+        saved = db.execute(select(
+            cargas_table.c.nombres_pedidos,
+            cargas_table.c.nombres_facturas,
+        ).where(cargas_table.c.id == int(run_id))).first()
+        if not saved:
+            return [], []
+        try:
+            order_names = list(json.loads(saved.nombres_pedidos or "[]"))
+        except (TypeError, json.JSONDecodeError):
+            order_names = []
+        try:
+            invoice_names = list(json.loads(saved.nombres_facturas or "[]"))
+        except (TypeError, json.JSONDecodeError):
+            invoice_names = []
+
+        # Keep ledger rows if another saved run still references that invoice.
+        remaining = db.execute(select(cargas_table.c.nombres_facturas).where(
+            cargas_table.c.id != int(run_id)
+        )).all()
+        referenced_elsewhere: set[str] = set()
+        for row in remaining:
+            try:
+                referenced_elsewhere.update(json.loads(row.nombres_facturas or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+        removable_invoices = [name for name in invoice_names if name not in referenced_elsewhere]
+        if removable_invoices:
+            db.execute(delete(facturas_acumuladas_table).where(
+                facturas_acumuladas_table.c.archivo.in_(removable_invoices)
+            ))
+        db.execute(delete(detalle_table).where(detalle_table.c.carga_id == int(run_id)))
+        db.execute(delete(cargas_table).where(cargas_table.c.id == int(run_id)))
+    return order_names, invoice_names
+
+
 def file_fingerprint(order_files, invoice_files) -> str:
     digest = hashlib.sha256()
     for role, files in (("PEDIDO", order_files), ("FACTURA", invoice_files)):
@@ -1084,6 +1122,44 @@ def history_tab() -> None:
     if filtered.empty:
         return
     selected = st.selectbox("Ver detalle del procesamiento", filtered["id"].tolist(), format_func=lambda x: f"Procesamiento #{x}")
+    selected_row = history.loc[history["id"] == int(selected)].iloc[0]
+    try:
+        selected_orders = json.loads(selected_row.get("nombres_pedidos") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        selected_orders = []
+    try:
+        selected_invoices = json.loads(selected_row.get("nombres_facturas") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        selected_invoices = []
+
+    with st.expander("✏️ Modificar o eliminar esta carga"):
+        st.write(
+            "Elimina este procesamiento para corregir sus archivos y volverlos a cargar desde "
+            "**📦 Procesar pedidos**. También se retirarán sus facturas del acumulado de indicadores."
+        )
+        files_left, files_right = st.columns(2)
+        files_left.caption("Pedidos de esta carga")
+        files_left.write("\n".join(f"• {name}" for name in selected_orders) or "Sin archivos registrados")
+        files_right.caption("Facturas de esta carga")
+        files_right.write("\n".join(f"• {name}" for name in selected_invoices) or "Sin archivos registrados")
+        delete_confirmed = st.checkbox(
+            f"Confirmo que deseo eliminar el procesamiento #{selected}",
+            key=f"confirm_delete_run_{selected}",
+        )
+        if st.button(
+            "Eliminar procesamiento seleccionado",
+            type="primary",
+            disabled=not delete_confirmed,
+            key=f"delete_run_{selected}",
+        ):
+            delete_saved_run(int(selected))
+            st.session_state.pop("last_result", None)
+            st.session_state.pop("pending_result", None)
+            st.success(
+                f"Procesamiento #{selected} eliminado. Ya puedes corregir y volver a cargar sus archivos."
+            )
+            st.rerun()
+
     detail_columns = [detalle_table.c[c] for c in DETAIL_COLUMNS]
     with get_engine().connect() as db:
         detail = pd.read_sql(
