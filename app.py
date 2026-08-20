@@ -16,12 +16,13 @@ import streamlit as st
 from sqlalchemy import (
     Column, Date as SQLDate, DateTime, Float, ForeignKey, Index, Integer,
     MetaData, String, Table, Text, UniqueConstraint, create_engine, delete,
-    insert, select, update,
+    insert, select, text as sql_text, update,
 )
 
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "fillrate.db"
+BUSINESS_LINES = ["Karay", "Lácteos El Pino"]
 
 metadata = MetaData()
 cargas_table = Table(
@@ -29,6 +30,7 @@ cargas_table = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("fecha", DateTime, nullable=False),
     Column("cliente", String(200), nullable=False, default=""),
+    Column("linea_negocio", String(80), nullable=False, default="Karay"),
     Column("usuario", String(120), nullable=False, default=""),
     Column("fill_rate", Float, nullable=False),
     Column("venta_potencial", Float, nullable=False),
@@ -65,7 +67,7 @@ Index("idx_cargas_fecha", cargas_table.c.fecha)
 forecast_table = Table(
     "forecast", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("periodo", String(7), nullable=False, unique=True),
+    Column("periodo", String(80), nullable=False, unique=True),
     Column("archivo", String(255), nullable=False, default=""),
     Column("actualizado", DateTime, nullable=False),
 )
@@ -82,7 +84,7 @@ forecast_detalle_table = Table(
 produccion_table = Table(
     "produccion", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("periodo", String(7), nullable=False, unique=True),
+    Column("periodo", String(80), nullable=False, unique=True),
     Column("archivo", String(255), nullable=False, default=""),
     Column("actualizado", DateTime, nullable=False),
 )
@@ -101,6 +103,7 @@ facturas_acumuladas_table = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("archivo_hash", String(64), nullable=False),
     Column("archivo", String(255), nullable=False),
+    Column("linea_negocio", String(80), nullable=False, default="Karay"),
     Column("linea", Integer, nullable=False),
     Column("fecha_documento", SQLDate, nullable=False),
     Column("codigo_interno", String(20), nullable=False, default=""),
@@ -141,6 +144,56 @@ def get_engine():
 
 def init_database() -> None:
     metadata.create_all(get_engine())
+    # Forward-compatible migration for databases created before business lines.
+    # Existing information always belongs to the original Karay operation.
+    engine = get_engine()
+    with engine.begin() as db:
+        if engine.dialect.name == "postgresql":
+            db.execute(sql_text(
+                "ALTER TABLE cargas ADD COLUMN IF NOT EXISTS "
+                "linea_negocio VARCHAR(80) NOT NULL DEFAULT 'Karay'"
+            ))
+            db.execute(sql_text(
+                "ALTER TABLE facturas_acumuladas ADD COLUMN IF NOT EXISTS "
+                "linea_negocio VARCHAR(80) NOT NULL DEFAULT 'Karay'"
+            ))
+            db.execute(sql_text("ALTER TABLE forecast ALTER COLUMN periodo TYPE VARCHAR(80)"))
+            db.execute(sql_text("ALTER TABLE produccion ALTER COLUMN periodo TYPE VARCHAR(80)"))
+        elif engine.dialect.name == "sqlite":
+            carga_columns = {row[1] for row in db.execute(sql_text("PRAGMA table_info(cargas)"))}
+            if "linea_negocio" not in carga_columns:
+                db.execute(sql_text(
+                    "ALTER TABLE cargas ADD COLUMN linea_negocio VARCHAR(80) NOT NULL DEFAULT 'Karay'"
+                ))
+            ledger_columns = {
+                row[1] for row in db.execute(sql_text("PRAGMA table_info(facturas_acumuladas)"))
+            }
+            if "linea_negocio" not in ledger_columns:
+                db.execute(sql_text(
+                    "ALTER TABLE facturas_acumuladas ADD COLUMN "
+                    "linea_negocio VARCHAR(80) NOT NULL DEFAULT 'Karay'"
+                ))
+        db.execute(sql_text(
+            "UPDATE forecast SET periodo = periodo || '|Karay' "
+            "WHERE periodo NOT LIKE '%|%'"
+        ))
+        db.execute(sql_text(
+            "UPDATE produccion SET periodo = periodo || '|Karay' "
+            "WHERE periodo NOT LIKE '%|%'"
+        ))
+
+
+def period_key(period: str, business_line: str) -> str:
+    return f"{period}|{business_line}"
+
+
+def period_from_key(value: str) -> str:
+    return str(value).split("|", 1)[0]
+
+
+def line_from_period_key(value: str) -> str:
+    parts = str(value).split("|", 1)
+    return parts[1] if len(parts) == 2 else "Karay"
 
 
 def normalize_number(value: object) -> float:
@@ -603,7 +656,7 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
     return pd.DataFrame(all_rows), clients, warnings
 
 
-def save_invoice_ledger(invoice_rows: pd.DataFrame) -> None:
+def save_invoice_ledger(invoice_rows: pd.DataFrame, business_line: str) -> None:
     """Refresh uploaded invoices in the cumulative ledger without duplicating files."""
     if invoice_rows.empty or "archivo_hash" not in invoice_rows:
         return
@@ -615,17 +668,20 @@ def save_invoice_ledger(invoice_rows: pd.DataFrame) -> None:
                 sequence = re.sub(r"\D", "", str(invoice_number))[-9:]
                 if sequence:
                     db.execute(delete(facturas_acumuladas_table).where(
-                        facturas_acumuladas_table.c.archivo.like(f"%{sequence}%")
+                        facturas_acumuladas_table.c.archivo.like(f"%{sequence}%"),
+                        facturas_acumuladas_table.c.linea_negocio == business_line,
                     ))
         for file_hash in invoice_rows["archivo_hash"].dropna().unique():
             db.execute(delete(facturas_acumuladas_table).where(
-                facturas_acumuladas_table.c.archivo_hash == str(file_hash)
+                facturas_acumuladas_table.c.archivo_hash == str(file_hash),
+                facturas_acumuladas_table.c.linea_negocio == business_line,
             ))
         records = []
         for _, row in invoice_rows.iterrows():
             records.append({
                 "archivo_hash": str(row.get("archivo_hash", "")),
                 "archivo": str(row.get("archivo_nombre", "")),
+                "linea_negocio": business_line,
                 "linea": int(row.get("linea", 0)),
                 "fecha_documento": row.get("fecha_documento") or date.today(),
                 "codigo_interno": str(row.get("codigo_interno", "")).strip().zfill(8),
@@ -676,9 +732,12 @@ def forecast_dataframe(uploaded_file) -> pd.DataFrame:
     )
 
 
-def save_forecast(period: str, uploaded_file, forecast_rows: pd.DataFrame) -> int:
+def save_forecast(period: str, business_line: str, uploaded_file, forecast_rows: pd.DataFrame) -> int:
+    storage_period = period_key(period, business_line)
     with get_engine().begin() as db:
-        existing = db.execute(select(forecast_table.c.id).where(forecast_table.c.periodo == period)).first()
+        existing = db.execute(
+            select(forecast_table.c.id).where(forecast_table.c.periodo == storage_period)
+        ).first()
         if existing:
             forecast_id = int(existing.id)
             db.execute(update(forecast_table).where(forecast_table.c.id == forecast_id).values(
@@ -687,7 +746,7 @@ def save_forecast(period: str, uploaded_file, forecast_rows: pd.DataFrame) -> in
             db.execute(delete(forecast_detalle_table).where(forecast_detalle_table.c.forecast_id == forecast_id))
         else:
             created = db.execute(insert(forecast_table).values(
-                periodo=period, archivo=uploaded_file.name, actualizado=datetime.now()
+                periodo=storage_period, archivo=uploaded_file.name, actualizado=datetime.now()
             ))
             forecast_id = int(created.inserted_primary_key[0])
         db.execute(insert(forecast_detalle_table), [
@@ -703,11 +762,12 @@ def save_forecast(period: str, uploaded_file, forecast_rows: pd.DataFrame) -> in
     return forecast_id
 
 
-def save_production(period: str, uploaded_file, production_rows: pd.DataFrame) -> int:
+def save_production(period: str, business_line: str, uploaded_file, production_rows: pd.DataFrame) -> int:
     """Save or replace the production assigned to a monthly forecast."""
+    storage_period = period_key(period, business_line)
     with get_engine().begin() as db:
         existing = db.execute(
-            select(produccion_table.c.id).where(produccion_table.c.periodo == period)
+            select(produccion_table.c.id).where(produccion_table.c.periodo == storage_period)
         ).first()
         if existing:
             production_id = int(existing.id)
@@ -719,7 +779,7 @@ def save_production(period: str, uploaded_file, production_rows: pd.DataFrame) -
             ))
         else:
             created = db.execute(insert(produccion_table).values(
-                periodo=period, archivo=uploaded_file.name, actualizado=datetime.now()
+                periodo=storage_period, archivo=uploaded_file.name, actualizado=datetime.now()
             ))
             production_id = int(created.inserted_primary_key[0])
         db.execute(insert(produccion_detalle_table), [
@@ -865,6 +925,7 @@ def delete_saved_run(run_id: int) -> tuple[list[str], list[str]]:
         saved = db.execute(select(
             cargas_table.c.nombres_pedidos,
             cargas_table.c.nombres_facturas,
+            cargas_table.c.linea_negocio,
         ).where(cargas_table.c.id == int(run_id))).first()
         if not saved:
             return [], []
@@ -890,15 +951,17 @@ def delete_saved_run(run_id: int) -> tuple[list[str], list[str]]:
         removable_invoices = [name for name in invoice_names if name not in referenced_elsewhere]
         if removable_invoices:
             db.execute(delete(facturas_acumuladas_table).where(
-                facturas_acumuladas_table.c.archivo.in_(removable_invoices)
+                facturas_acumuladas_table.c.archivo.in_(removable_invoices),
+                facturas_acumuladas_table.c.linea_negocio == saved.linea_negocio,
             ))
         db.execute(delete(detalle_table).where(detalle_table.c.carga_id == int(run_id)))
         db.execute(delete(cargas_table).where(cargas_table.c.id == int(run_id)))
     return order_names, invoice_names
 
 
-def file_fingerprint(order_files, invoice_files) -> str:
+def file_fingerprint(order_files, invoice_files, business_line: str = "Karay") -> str:
     digest = hashlib.sha256()
+    digest.update(business_line.encode("utf-8"))
     for role, files in (("PEDIDO", order_files), ("FACTURA", invoice_files)):
         digest.update(role.encode("ascii"))
         for uploaded in sorted(files, key=lambda f: f.name):
@@ -909,12 +972,16 @@ def file_fingerprint(order_files, invoice_files) -> str:
     return digest.hexdigest()
 
 
-def save_run(detail: pd.DataFrame, summary: dict, cliente: str, usuario: str, order_files, invoice_files) -> tuple[int, bool]:
-    fingerprint = file_fingerprint(order_files, invoice_files)
+def save_run(
+    detail: pd.DataFrame, summary: dict, cliente: str, usuario: str,
+    business_line: str, order_files, invoice_files,
+) -> tuple[int, bool]:
+    fingerprint = file_fingerprint(order_files, invoice_files, business_line)
     with get_engine().begin() as db:
         existing = db.execute(select(cargas_table.c.id).where(cargas_table.c.fingerprint == fingerprint)).first()
         values = dict(
             fecha=datetime.now(), cliente=cliente, usuario=usuario,
+            linea_negocio=business_line,
             fill_rate=float(summary["fill_rate"]), venta_potencial=float(summary["venta_potencial"]),
             venta_facturada=float(summary["venta_facturada"]), venta_perdida=float(summary["venta_perdida"]),
             unidades_pedidas=float(summary["unidades_pedidas"]),
@@ -960,6 +1027,12 @@ def show_metrics(summary: dict) -> None:
 def processing_tab() -> None:
     st.subheader("Procesar Fill Rate")
     st.write("Carga uno o varios pedidos y facturas en PDF. Los resultados se consolidan y guardan en el histórico.")
+    business_line = st.selectbox(
+        "Línea de negocio",
+        BUSINESS_LINES,
+        key="processing_business_line",
+        help="Separa el Histórico y los Indicadores de Karay y Lácteos El Pino.",
+    )
     left, right = st.columns(2)
     # Some customers deliver valid PDF documents without the .pdf extension
     # (for example El Rosado). Leaving the extension filter open lets those
@@ -999,7 +1072,8 @@ def processing_tab() -> None:
                 "invoice_rows": invoice_rows,
                 "cliente": detected_client,
                 "usuario": usuario.strip() or "Operador",
-                "fingerprint": file_fingerprint(order_files, invoice_files),
+                "business_line": business_line,
+                "fingerprint": file_fingerprint(order_files, invoice_files, business_line),
                 "warnings": order_warnings + invoice_warnings,
             }
             st.session_state["last_result"] = (detail, summary)
@@ -1020,16 +1094,18 @@ def processing_tab() -> None:
         pending = st.session_state.get("pending_result")
         if not pending or not order_files or not invoice_files:
             st.error("Primero carga los archivos y pulsa Procesar y revisar.")
-        elif file_fingerprint(order_files, invoice_files) != pending["fingerprint"]:
+        elif business_line != pending["business_line"]:
+            st.error("La línea de negocio cambió después de la revisión. Procesa nuevamente.")
+        elif file_fingerprint(order_files, invoice_files, business_line) != pending["fingerprint"]:
             st.error("Los archivos cambiaron después de la revisión. Pulsa nuevamente Procesar y revisar.")
         else:
             with st.spinner("Guardando el Histórico y actualizando el Forecast..."):
                 # The Forecast reads this cumulative, invoice-level ledger.
                 # Nothing reaches it until the user explicitly confirms Save.
-                save_invoice_ledger(pending["invoice_rows"])
+                save_invoice_ledger(pending["invoice_rows"], pending["business_line"])
                 run_id, created = save_run(
                     pending["detail"], pending["summary"], pending["cliente"],
-                    pending["usuario"], order_files, invoice_files,
+                    pending["usuario"], pending["business_line"], order_files, invoice_files,
                 )
             del st.session_state["pending_result"]
             if created:
@@ -1081,16 +1157,19 @@ def history_tab() -> None:
         st.info("Todavía no hay procesamientos guardados.")
         return
     history["fecha_dt"] = pd.to_datetime(history["fecha"])
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     start = c1.date_input("Desde", value=history["fecha_dt"].dt.date.min())
     end = c2.date_input("Hasta", value=date.today())
     clients = sorted(x for x in history["cliente"].dropna().unique() if x)
     client = c3.selectbox("Cliente", ["Todos", *clients])
+    business_line = c4.selectbox("Línea de negocio", ["Todas", *BUSINESS_LINES], key="history_line")
     filtered = history[(history["fecha_dt"].dt.date >= start) & (history["fecha_dt"].dt.date <= end)]
     if client != "Todos":
         filtered = filtered[filtered["cliente"] == client]
-    display = filtered[["id", "fecha_dt", "cliente", "usuario", "fill_rate", "venta_perdida", "pedidos_archivos", "facturas_archivos"]].copy()
-    display.columns = ["ID", "Fecha", "Cliente", "Usuario", "Fill Rate", "Venta perdida", "Pedidos", "Facturas"]
+    if business_line != "Todas":
+        filtered = filtered[filtered["linea_negocio"] == business_line]
+    display = filtered[["id", "fecha_dt", "linea_negocio", "cliente", "usuario", "fill_rate", "venta_perdida", "pedidos_archivos", "facturas_archivos"]].copy()
+    display.columns = ["ID", "Fecha", "Línea de negocio", "Cliente", "Usuario", "Fill Rate", "Venta perdida", "Pedidos", "Facturas"]
     st.dataframe(display, width="stretch", hide_index=True, column_config={
         "Fecha": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm"),
         "Fill Rate": st.column_config.NumberColumn(format="%.2f%%"),
@@ -1165,6 +1244,11 @@ def history_tab() -> None:
 def forecast_tab() -> None:
     st.subheader("📊 Indicadores")
     st.write("Control mensual por unidades: pedidos, entregas, producción y forecast.")
+    indicator_line = st.selectbox(
+        "Línea de negocio",
+        BUSINESS_LINES,
+        key="indicator_business_line",
+    )
 
     with st.expander("⚙️ Cargar o reemplazar forecast", expanded=False):
         upload_left, upload_right = st.columns([2, 1])
@@ -1181,9 +1265,9 @@ def forecast_tab() -> None:
                 try:
                     rows = forecast_dataframe(forecast_file)
                     period = month_value.strftime("%Y-%m")
-                    save_forecast(period, forecast_file, rows)
+                    save_forecast(period, indicator_line, forecast_file, rows)
                     st.success(
-                        f"Forecast {period} guardado: {len(rows)} productos y "
+                        f"Forecast {period} de {indicator_line} guardado: {len(rows)} productos y "
                         f"{rows['unidades'].sum():,.0f} unidades."
                     )
                 except Exception as exc:
@@ -1191,12 +1275,19 @@ def forecast_tab() -> None:
 
     with get_engine().connect() as db:
         available = pd.read_sql(select(forecast_table).order_by(forecast_table.c.periodo.desc()), db)
+    if not available.empty:
+        available["linea_negocio"] = available["periodo"].map(line_from_period_key)
+        available["periodo_visible"] = available["periodo"].map(period_from_key)
+        available = available[available["linea_negocio"] == indicator_line].copy()
     if available.empty:
-        st.info("Carga el primer forecast para habilitar los indicadores.")
+        st.info(f"Carga el primer forecast de {indicator_line} para habilitar los indicadores.")
         return
 
-    selected_period = st.selectbox("Periodo de análisis", available["periodo"].tolist(), key="indicator_period")
-    forecast_id = int(available.loc[available["periodo"] == selected_period, "id"].iloc[0])
+    selected_period = st.selectbox(
+        "Periodo de análisis", available["periodo_visible"].tolist(),
+        key=f"indicator_period_{indicator_line}",
+    )
+    forecast_id = int(available.loc[available["periodo_visible"] == selected_period, "id"].iloc[0])
     year, month = map(int, selected_period.split("-"))
     period_start = date(year, month, 1)
     period_end = date(year + (month == 12), 1 if month == 12 else month + 1, 1)
@@ -1222,6 +1313,7 @@ def forecast_tab() -> None:
             ).select_from(detalle_table.join(cargas_table, detalle_table.c.carga_id == cargas_table.c.id)).where(
                 cargas_table.c.fecha >= start_dt,
                 cargas_table.c.fecha < end_dt,
+                cargas_table.c.linea_negocio == indicator_line,
             ), db,
         )
 
@@ -1284,15 +1376,19 @@ def forecast_tab() -> None:
         st.markdown("#### Producción destinada al forecast vs. forecast")
         production_file = st.file_uploader(
             "Producción del mes (columnas COD y Unidades)",
-            type=["xlsx", "xls", "csv", "txt"], key=f"production_{selected_period}"
+            type=["xlsx", "xls", "csv", "txt"],
+            key=f"production_{selected_period}_{indicator_line}"
         )
-        if st.button("Guardar o reemplazar producción", type="primary", key="save_production"):
+        if st.button(
+            "Guardar o reemplazar producción", type="primary",
+            key=f"save_production_{selected_period}_{indicator_line}",
+        ):
             if production_file is None:
                 st.error("Selecciona el archivo de producción.")
             else:
                 try:
                     production_rows = forecast_dataframe(production_file)
-                    save_production(selected_period, production_file, production_rows)
+                    save_production(selected_period, indicator_line, production_file, production_rows)
                     st.success(
                         f"Producción {selected_period} guardada: "
                         f"{production_rows['unidades'].sum():,.0f} unidades."
@@ -1302,7 +1398,9 @@ def forecast_tab() -> None:
 
         with get_engine().connect() as db:
             production_header = db.execute(
-                select(produccion_table.c.id).where(produccion_table.c.periodo == selected_period)
+                select(produccion_table.c.id).where(
+                    produccion_table.c.periodo == period_key(selected_period, indicator_line)
+                )
             ).first()
             if production_header:
                 produced = pd.read_sql(
