@@ -6,6 +6,8 @@ import io
 import json
 import os
 import re
+import unicodedata
+from difflib import SequenceMatcher
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
@@ -879,11 +881,18 @@ def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFr
         frame["codigo_interno"] = frame["codigo_interno"].map(normalize_internal)
 
     # The invoice normally contains both identifiers. Use it as a homologation
-    # table so an order carrying only EAN can still match by internal code.
+    # table so an order carrying only EAN can still match by internal code, but
+    # only when that EAN maps to one internal code. Some customers reuse the
+    # same EAN with a different internal reference, so a global first-match
+    # mapping would assign those orders to the wrong product.
     invoice_codes = invoices[
         (invoices["codigo"] != "") & (invoices["codigo_interno"] != "")
-    ].drop_duplicates("codigo")
-    ean_to_internal = dict(zip(invoice_codes["codigo"], invoice_codes["codigo_interno"]))
+    ].groupby("codigo")["codigo_interno"].agg(lambda values: list(dict.fromkeys(values)))
+    ean_to_internal = {
+        ean: internal_codes[0]
+        for ean, internal_codes in invoice_codes.items()
+        if len(internal_codes) == 1
+    }
     orders["codigo_interno"] = orders.apply(
         lambda row: row.codigo_interno or ean_to_internal.get(row.codigo, ""), axis=1
     )
@@ -908,12 +917,60 @@ def reconcile(order_rows: pd.DataFrame, invoice_rows: pd.DataFrame) -> pd.DataFr
         axis=1,
     )
 
-    def match_key(row: pd.Series) -> str:
-        identity = row.codigo_interno or row.codigo
-        return f"{row.oc}|{identity}" if row.oc else identity
+    def normalized_product(value: object) -> str:
+        value = unicodedata.normalize("NFKD", str(value or ""))
+        value = "".join(character for character in value if not unicodedata.combining(character))
+        value = re.sub(r"(?<=\d)\s+(?=[A-Z])", "", value.upper())
+        words = re.findall(r"[A-Z0-9]+", value)
+        ignored = {"DE", "DEL", "LA", "EL", "EN", "DOYPACK", "FRASCO"}
+        normalized = []
+        for word in words:
+            if word in ignored:
+                continue
+            # A light singularization makes SEMILLA/SEMILLAS and similar
+            # descriptions comparable without changing their meaning.
+            if len(word) > 4 and word.endswith("S"):
+                word = word[:-1]
+            normalized.append(word)
+        return " ".join(normalized)
 
-    orders["match_key"] = orders.apply(match_key, axis=1)
-    invoices["match_key"] = invoices.apply(match_key, axis=1)
+    orders["product_key"] = orders["producto"].map(normalized_product)
+    invoices["product_key"] = invoices["producto"].map(normalized_product)
+    orders["match_key"] = orders.apply(
+        lambda row: f"{row.oc}|{row.codigo_interno or row.codigo or row.product_key}", axis=1
+    )
+
+    def invoice_match_key(row: pd.Series) -> str:
+        candidates = orders[orders["oc"] == row.oc] if row.oc else orders
+        if candidates.empty:
+            return f"{row.oc}|{row.codigo_interno or row.codigo or row.product_key}"
+
+        if row.codigo_interno:
+            exact_internal = candidates[candidates["codigo_interno"] == row.codigo_interno]
+            if len(exact_internal) == 1:
+                return str(exact_internal.iloc[0].match_key)
+        if row.codigo:
+            exact_ean = candidates[candidates["codigo"] == row.codigo]
+            if len(exact_ean) == 1:
+                return str(exact_ean.iloc[0].match_key)
+
+        # TIA occasionally prints "No Tiene Productos Homologados". In those
+        # orders there is no supplier EAN/internal code, so use the product
+        # description only inside the same OC and only for a clear match.
+        if row.product_key:
+            scored = [
+                (SequenceMatcher(None, row.product_key, candidate.product_key).ratio(), candidate)
+                for candidate in candidates.itertuples()
+                if candidate.product_key
+            ]
+            scored.sort(key=lambda item: item[0], reverse=True)
+            if scored and scored[0][0] >= 0.72 and (
+                len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08
+            ):
+                return str(scored[0][1].match_key)
+        return f"{row.oc}|{row.codigo_interno or row.codigo or row.product_key}"
+
+    invoices["match_key"] = invoices.apply(invoice_match_key, axis=1)
     order_group = orders.groupby("match_key", as_index=False).agg(
         cliente=("cliente", "first"), oc=("oc", "first"),
         codigo=("codigo", "first"), producto=("producto", "first"),
