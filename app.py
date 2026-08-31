@@ -325,15 +325,27 @@ def favorita_order_rows(text: str) -> list[dict]:
 
 def odoo_order_rows(text: str) -> list[dict]:
     """Read customer sales orders exported from Odoo (for example S04899)."""
-    if "FECHA DE PEDIDO" not in text.upper() or "DESCRIPCIÓN CANTIDAD" not in text.upper():
+    has_order_header = bool(re.search(r"(?:ORDEN|ORDER)\s*#", text, re.I))
+    has_product_header = bool(re.search(
+        r"DESCRIP(?:CI[ÓO]N|TION)\s+(?:CANTIDAD|QUANTITY)", text, re.I
+    ))
+    if not has_order_header or not has_product_header:
         return []
-    oc_match = re.search(r"Orden\s*#\s*([A-Z0-9-]+)", text, re.I)
-    oc = oc_match.group(1) if oc_match else ""
+    order_match = re.search(r"(?:Orden|Order)\s*#\s*([A-Z0-9-]+)", text, re.I)
+    # Odoo's sales-order number (S04754) is the invoice Source.  When the
+    # customer purchase order is printed as OC, that value must be used for
+    # reconciliation with the invoice.
+    oc = invoice_oc(text) or (order_match.group(1) if order_match else "")
     row_pattern = re.compile(
         r"^\[(?P<internal>[A-Z0-9]+)\]\s+(?P<body>.*?)"
-        r"(?=^\[[A-Z0-9]+\]|^Base imponible|\Z)", re.M | re.S,
+        r"(?=^\[[A-Z0-9]+\]|^(?:Base imponible|Subtotal|VAT|IVA|Total)\b|\Z)",
+        re.M | re.S | re.I,
     )
-    qty_price = re.compile(r"(?P<qty>(?:\d{1,3}(?:\.\d{3})+|\d+),\d{4})\s+(?:Unidades\s+)?(?P<price>\d+[.,]\d{5})")
+    qty_price = re.compile(
+        r"(?P<qty>(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{4})\s+"
+        r"(?:(?:Unidades|Units)\s+)?(?P<price>\d+[.,]\d{5})",
+        re.I,
+    )
     rows = []
     for match in row_pattern.finditer(text):
         internal = match.group("internal")
@@ -516,24 +528,35 @@ def rosado_order_rows(text: str, tables: Iterable[list[list[str | None]]]) -> li
 
 def odoo_invoice_rows(text: str, default_oc: str) -> list[dict]:
     """Read the Odoo/SRI invoice layout used by DISLUB."""
-    if "FACTURA" not in text.upper() or "CÓDIGO DESCRIPCIÓN CANTIDAD" not in text.upper():
+    upper_text = text.upper()
+    if "FACTURA" not in upper_text and "INVOICE" not in upper_text:
+        return []
+    if not re.search(
+        r"DESCRIP(?:CI[ÓO]N|TION)\s+(?:CANTIDAD|QUANTITY)", text, re.I
+    ):
         return []
     row_pattern = re.compile(
         r"^(?P<internal>\d{8})\s+\[(?P=internal)\]\s*(?P<body>.*?)"
-        r"(?=^\d{8}\s+\[|^FORMA DE PAGO|^Page:|\Z)",
+        r"(?=^\d{8}\s+\[|^(?:FORMA DE PAGO|PAYMENT METHODS)|^Page:|\Z)",
         re.M | re.S,
     )
     # Quantities may use Ecuadorian thousands separators (for example
     # 3.624,0000). Matching only the final digits would turn that into 624.
-    number_with_4_decimals = r"(?:\d{1,3}(?:\.\d{3})+|\d+),\d{4}"
+    number_with_4_decimals = r"(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{4}"
     qty_price = re.compile(
-        rf"(?P<qty>{number_with_4_decimals})\s+(?P<price>\d+[.,]\d{{5}})"
+        rf"(?P<qty>{number_with_4_decimals})\s+(?:(?:Unidades|Units)\s+)?"
+        rf"(?P<price>\d+[.,]\d{{5}})",
+        re.I,
     )
-    date_match = re.search(r"Fecha de emisi[oó]n:\s*(\d{2}/\d{2}/\d{4})", text, re.I)
-    document_date = (
-        datetime.strptime(date_match.group(1), "%d/%m/%Y").date()
-        if date_match else date.today()
-    )
+    spanish_date = re.search(r"Fecha de emisi[oó]n:\s*(\d{2}/\d{2}/\d{4})", text, re.I)
+    english_date = re.search(r"Emission Date:\s*(\d{2}/\d{2}/\d{4})", text, re.I)
+    try:
+        document_date = datetime.strptime(
+            (spanish_date or english_date).group(1),
+            "%d/%m/%Y" if spanish_date else "%m/%d/%Y",
+        ).date()
+    except (AttributeError, ValueError):
+        document_date = date.today()
     rows = []
     for match in row_pattern.finditer(text):
         body = re.sub(r"\s+", " ", match.group("body")).strip()
@@ -663,9 +686,17 @@ def text_rows(text: str, document_type: str, default_oc: str) -> list[dict]:
     return rows
 
 
-def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], list[str]]:
-    all_rows, clients, warnings = [], [], []
+def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], list[str], list[dict]]:
+    all_rows, clients, warnings, diagnostics = [], [], [], []
     for uploaded in files:
+        diagnostic = {
+            "archivo": uploaded.name,
+            "tipo": "Pedido" if document_type == "pedido" else "Factura",
+            "parser": "Sin reconocer",
+            "productos": 0,
+            "estado": "No reconocido",
+            "motivo": "No se encontró una tabla de productos compatible.",
+        }
         try:
             text, tables = extract_pdf(uploaded)
             oc, client = find_context(text)
@@ -680,16 +711,32 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
             if client:
                 clients.append(client)
             if document_type == "pedido":
-                rows = (
-                    favorita_order_rows(text)
-                    or odoo_order_rows(text)
-                    or coral_order_rows(text, tables)
-                    or tia_order_rows(text, tables)
-                    or rosado_order_rows(text, tables)
+                parsers = (
+                    ("Corporación Favorita", lambda: favorita_order_rows(text)),
+                    ("Odoo Pedido", lambda: odoo_order_rows(text)),
+                    ("Coral / Gerardo Ortiz", lambda: coral_order_rows(text, tables)),
+                    ("Tía", lambda: tia_order_rows(text, tables)),
+                    ("Corporación El Rosado", lambda: rosado_order_rows(text, tables)),
                 )
             else:
-                rows = odoo_invoice_bundle_rows(text) or odoo_invoice_rows(text, oc)
-            rows = rows or table_rows(tables, document_type, oc) or text_rows(text, document_type, oc)
+                parsers = (
+                    ("Odoo Facturas múltiples", lambda: odoo_invoice_bundle_rows(text)),
+                    ("Odoo Factura", lambda: odoo_invoice_rows(text, oc)),
+                )
+            rows = []
+            for parser_name, parser in parsers:
+                rows = parser()
+                if rows:
+                    diagnostic["parser"] = parser_name
+                    break
+            if not rows:
+                rows = table_rows(tables, document_type, oc)
+                if rows:
+                    diagnostic["parser"] = "Tabla genérica"
+            if not rows:
+                rows = text_rows(text, document_type, oc)
+                if rows:
+                    diagnostic["parser"] = "Texto genérico"
             rows = [row for row in rows if not excluded_product(row)]
             if document_type == "pedido":
                 detected_order_client = known_customer(text) or client or "Cliente sin identificar"
@@ -697,6 +744,12 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
                     row["cliente"] = detected_order_client
             if not rows:
                 warnings.append(f"{uploaded.name}: no se reconocieron líneas de productos.")
+            else:
+                diagnostic.update({
+                    "productos": len(rows),
+                    "estado": "Correcto",
+                    "motivo": "Productos extraídos correctamente.",
+                })
             if document_type == "factura":
                 uploaded.seek(0)
                 file_hash = hashlib.sha256(uploaded.read()).hexdigest()
@@ -712,7 +765,9 @@ def parse_files(files, document_type: str) -> tuple[pd.DataFrame, list[str], lis
             all_rows.extend(rows)
         except Exception as exc:
             warnings.append(f"{uploaded.name}: no se pudo leer ({exc}).")
-    return pd.DataFrame(all_rows), clients, warnings
+            diagnostic["motivo"] = f"No se pudo leer el PDF: {exc}"
+        diagnostics.append(diagnostic)
+    return pd.DataFrame(all_rows), clients, warnings, diagnostics
 
 
 def save_invoice_ledger(invoice_rows: pd.DataFrame, business_line: str) -> None:
@@ -1138,6 +1193,30 @@ def show_metrics(summary: dict) -> None:
     st.caption(f"{summary['unidades_facturadas']:,.0f} de {summary['unidades_pedidas']:,.0f} unidades atendidas")
 
 
+def show_pdf_diagnostics(diagnostics: list[dict]) -> None:
+    """Show a compact preview for successful and failed PDF parsers."""
+    if not diagnostics:
+        return
+    successful = sum(item["estado"] == "Correcto" for item in diagnostics)
+    with st.expander(
+        f"🔍 Diagnóstico de lectura PDF ({successful}/{len(diagnostics)} reconocidos)",
+        expanded=successful != len(diagnostics),
+    ):
+        st.dataframe(
+            pd.DataFrame(diagnostics),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "archivo": st.column_config.TextColumn("Archivo"),
+                "tipo": st.column_config.TextColumn("Tipo"),
+                "parser": st.column_config.TextColumn("Parser utilizado"),
+                "productos": st.column_config.NumberColumn("Productos", format="%d"),
+                "estado": st.column_config.TextColumn("Estado"),
+                "motivo": st.column_config.TextColumn("Detalle"),
+            },
+        )
+
+
 def processing_tab() -> None:
     st.subheader("Procesar Fill Rate")
     st.write("Carga uno o varios pedidos y facturas en PDF. Los resultados se consolidan y guardan en el histórico.")
@@ -1169,12 +1248,18 @@ def processing_tab() -> None:
             st.error("Selecciona al menos un pedido y una factura PDF.")
             return
         with st.spinner("Leyendo y conciliando los documentos..."):
-            order_rows, order_clients, order_warnings = parse_files(order_files, "pedido")
-            invoice_rows, invoice_clients, invoice_warnings = parse_files(invoice_files, "factura")
+            order_rows, order_clients, order_warnings, order_diagnostics = parse_files(
+                order_files, "pedido"
+            )
+            invoice_rows, invoice_clients, invoice_warnings, invoice_diagnostics = parse_files(
+                invoice_files, "factura"
+            )
+            pdf_diagnostics = order_diagnostics + invoice_diagnostics
             try:
                 detail = reconcile(order_rows, invoice_rows)
             except ValueError as exc:
                 st.error(str(exc))
+                show_pdf_diagnostics(pdf_diagnostics)
                 for warning in order_warnings + invoice_warnings:
                     st.warning(warning)
                 return
@@ -1189,12 +1274,14 @@ def processing_tab() -> None:
                 "business_line": business_line,
                 "fingerprint": file_fingerprint(order_files, invoice_files, business_line),
                 "warnings": order_warnings + invoice_warnings,
+                "diagnostics": pdf_diagnostics,
             }
             st.session_state["last_result"] = (detail, summary)
         st.info(
             "Resultados procesados para revisión. Todavía no se guardaron en el Histórico "
             "ni se actualizó el Forecast. Revisa la información y luego pulsa Guardar."
         )
+        show_pdf_diagnostics(pdf_diagnostics)
         for warning in order_warnings + invoice_warnings:
             st.warning(warning)
 
