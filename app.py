@@ -1736,6 +1736,17 @@ def forecast_tab() -> None:
             )
 
 
+BUILTIN_OPERATOR_USERS = {
+    "Asistente": {
+        "display_name": "Asistente",
+        "role": "operador",
+        "salt": "b7778b92b0a3511384a3bfee3d6b52eb",
+        "password_hash": "dcbad6538ac32e20247a67901b346ac2cc0217d3e4ea6f3085e143e85afa6575",
+        "iterations": 390000,
+    }
+}
+
+
 def configured_users() -> dict[str, str]:
     try:
         users = st.secrets.get("users", {})
@@ -1744,15 +1755,35 @@ def configured_users() -> dict[str, str]:
         return {}
 
 
+def verify_builtin_operator(username: str, password: str) -> dict | None:
+    account = BUILTIN_OPERATOR_USERS.get(username)
+    if account is None:
+        return None
+    try:
+        candidate = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(account["salt"]),
+            int(account["iterations"]),
+        ).hex()
+    except Exception:
+        return None
+    if not hmac.compare_digest(candidate, str(account["password_hash"])):
+        return None
+    return account
+
+
 def login_required() -> bool:
     users = configured_users()
-    if not users:
+    if not users and not BUILTIN_OPERATOR_USERS:
         st.session_state.setdefault("username", "Operador local")
+        st.session_state.setdefault("role", "admin")
         st.caption("Modo local: el acceso con contraseña se activará al publicar la aplicación.")
         return True
     if st.session_state.get("authenticated"):
         top_left, top_right = st.columns([8, 1])
-        top_left.caption(f"Sesión: {st.session_state['username']}")
+        role_label = "Administrador" if st.session_state.get("role", "admin") == "admin" else "Operador"
+        top_left.caption(f"Sesión: {st.session_state['username']} · {role_label}")
         if top_right.button("Salir"):
             st.session_state.clear()
             st.rerun()
@@ -1768,6 +1799,13 @@ def login_required() -> bool:
         if expected is not None and hmac.compare_digest(password, expected):
             st.session_state["authenticated"] = True
             st.session_state["username"] = username
+            st.session_state["role"] = "admin"
+            st.rerun()
+        operator = verify_builtin_operator(username, password)
+        if operator is not None:
+            st.session_state["authenticated"] = True
+            st.session_state["username"] = str(operator.get("display_name") or username)
+            st.session_state["role"] = str(operator.get("role") or "operador")
             st.rerun()
         st.error("Usuario o contraseña incorrectos.")
     return False
@@ -1779,6 +1817,12 @@ def main() -> None:
         return
     init_database()
     st.title("📦 Karay Fill Rate")
+    role = st.session_state.get("role", "admin")
+    if role == "operador":
+        st.info("Sesión de operador: puedes procesar pedidos y facturas para calcular y guardar el Fill Rate.")
+        processing_tab()
+        return
+
     process, history, forecast = st.tabs(["📦 Procesar pedidos", "🕘 Histórico", "📊 Indicadores"])
     with process:
         processing_tab()
