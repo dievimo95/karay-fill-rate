@@ -114,6 +114,20 @@ facturas_acumuladas_table = Table(
     Column("unidades", Float, nullable=False),
     UniqueConstraint("archivo_hash", "linea", name="uq_factura_archivo_linea"),
 )
+usuarios_table = Table(
+    "usuarios", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("username", String(80), nullable=False, unique=True),
+    Column("nombre", String(120), nullable=False),
+    Column("password_hash", String(128), nullable=False),
+    Column("salt", String(64), nullable=False),
+    Column("iterations", Integer, nullable=False, default=390000),
+    Column("rol", String(30), nullable=False, default="operador"),
+    Column("activo", Integer, nullable=False, default=1),
+    Column("creado", DateTime, nullable=False),
+    Column("actualizado", DateTime, nullable=False),
+)
+Index("idx_usuarios_username", usuarios_table.c.username)
 Index("idx_forecast_periodo", forecast_table.c.periodo)
 Index("idx_produccion_periodo", produccion_table.c.periodo)
 Index("idx_facturas_fecha", facturas_acumuladas_table.c.fecha_documento)
@@ -1736,15 +1750,7 @@ def forecast_tab() -> None:
             )
 
 
-BUILTIN_OPERATOR_USERS = {
-    "Asistente": {
-        "display_name": "Asistente",
-        "role": "operador",
-        "salt": "b7778b92b0a3511384a3bfee3d6b52eb",
-        "password_hash": "dcbad6538ac32e20247a67901b346ac2cc0217d3e4ea6f3085e143e85afa6575",
-        "iterations": 390000,
-    }
-}
+PASSWORD_ITERATIONS = 390000
 
 
 def configured_users() -> dict[str, str]:
@@ -1755,31 +1761,211 @@ def configured_users() -> dict[str, str]:
         return {}
 
 
-def verify_builtin_operator(username: str, password: str) -> dict | None:
-    account = BUILTIN_OPERATOR_USERS.get(username)
-    if account is None:
+def hash_password(password: str, salt: bytes | None = None, iterations: int = PASSWORD_ITERATIONS) -> tuple[str, str, int]:
+    salt = salt or os.urandom(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    ).hex()
+    return password_hash, salt.hex(), iterations
+
+
+def authenticate_database_user(username: str, password: str) -> dict | None:
+    normalized = username.strip().lower()
+    if not normalized:
+        return None
+    with get_engine().connect() as db:
+        row = db.execute(
+            select(usuarios_table).where(usuarios_table.c.username == normalized)
+        ).mappings().first()
+    if row is None or int(row["activo"] or 0) != 1:
         return None
     try:
         candidate = hashlib.pbkdf2_hmac(
             "sha256",
             password.encode("utf-8"),
-            bytes.fromhex(account["salt"]),
-            int(account["iterations"]),
+            bytes.fromhex(str(row["salt"])),
+            int(row["iterations"]),
         ).hex()
     except Exception:
         return None
-    if not hmac.compare_digest(candidate, str(account["password_hash"])):
+    if not hmac.compare_digest(candidate, str(row["password_hash"])):
         return None
-    return account
+    return dict(row)
+
+
+def create_app_user(username: str, nombre: str, password: str, rol: str) -> tuple[bool, str]:
+    normalized = username.strip().lower()
+    display_name = nombre.strip()
+    if not re.fullmatch(r"[a-z0-9._-]{3,40}", normalized):
+        return False, "El usuario debe tener entre 3 y 40 caracteres y usar solo letras, números, punto, guion o guion bajo."
+    if len(display_name) < 2:
+        return False, "Ingresa el nombre de la persona."
+    if len(password) < 8:
+        return False, "La contraseña debe tener al menos 8 caracteres."
+    if rol not in {"operador", "admin"}:
+        return False, "Rol no válido."
+    if any(normalized == user.strip().lower() for user in configured_users()):
+        return False, "Ese usuario ya existe como usuario administrador de la aplicación."
+
+    password_hash, salt, iterations = hash_password(password)
+    now = datetime.now()
+    try:
+        with get_engine().begin() as db:
+            existing = db.execute(
+                select(usuarios_table.c.id).where(usuarios_table.c.username == normalized)
+            ).first()
+            if existing:
+                return False, "Ese nombre de usuario ya existe."
+            db.execute(insert(usuarios_table).values(
+                username=normalized,
+                nombre=display_name,
+                password_hash=password_hash,
+                salt=salt,
+                iterations=iterations,
+                rol=rol,
+                activo=1,
+                creado=now,
+                actualizado=now,
+            ))
+    except Exception as exc:
+        return False, f"No se pudo crear el usuario: {exc}"
+    return True, f"Usuario {normalized} creado correctamente."
+
+
+def update_app_user(user_id: int, nombre: str, rol: str, activo: bool, new_password: str = "") -> tuple[bool, str]:
+    values = {
+        "nombre": nombre.strip(),
+        "rol": rol,
+        "activo": 1 if activo else 0,
+        "actualizado": datetime.now(),
+    }
+    if len(values["nombre"]) < 2:
+        return False, "Ingresa el nombre de la persona."
+    if rol not in {"operador", "admin"}:
+        return False, "Rol no válido."
+    if new_password:
+        if len(new_password) < 8:
+            return False, "La nueva contraseña debe tener al menos 8 caracteres."
+        password_hash, salt, iterations = hash_password(new_password)
+        values.update({
+            "password_hash": password_hash,
+            "salt": salt,
+            "iterations": iterations,
+        })
+    try:
+        with get_engine().begin() as db:
+            db.execute(
+                update(usuarios_table)
+                .where(usuarios_table.c.id == int(user_id))
+                .values(**values)
+            )
+    except Exception as exc:
+        return False, f"No se pudo actualizar el usuario: {exc}"
+    return True, "Usuario actualizado correctamente."
+
+
+def users_tab() -> None:
+    st.subheader("👥 Usuarios")
+    st.write("Crea accesos independientes para tu equipo. Las contraseñas se guardan cifradas y no se muestran después de crearlas.")
+
+    with st.expander("➕ Crear nuevo usuario", expanded=True):
+        with st.form("create_user_form", clear_on_submit=True):
+            left, right = st.columns(2)
+            username = left.text_input("Usuario", placeholder="ej. maria")
+            nombre = right.text_input("Nombre", placeholder="ej. María Pérez")
+            role_label = left.selectbox("Rol", ["Operador", "Administrador"])
+            password = right.text_input("Contraseña", type="password")
+            confirm_password = right.text_input("Confirmar contraseña", type="password")
+            submitted = st.form_submit_button("Crear usuario", type="primary", width="stretch")
+        if submitted:
+            if password != confirm_password:
+                st.error("Las contraseñas no coinciden.")
+            else:
+                rol = "admin" if role_label == "Administrador" else "operador"
+                ok, message = create_app_user(username, nombre, password, rol)
+                if ok:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+
+    with get_engine().connect() as db:
+        users_df = pd.read_sql(
+            select(
+                usuarios_table.c.id,
+                usuarios_table.c.username,
+                usuarios_table.c.nombre,
+                usuarios_table.c.rol,
+                usuarios_table.c.activo,
+                usuarios_table.c.creado,
+                usuarios_table.c.actualizado,
+            ).order_by(usuarios_table.c.nombre),
+            db,
+        )
+
+    if users_df.empty:
+        st.info("Todavía no has creado usuarios desde este módulo.")
+        return
+
+    display = users_df.copy()
+    display["Rol"] = display["rol"].map({"admin": "Administrador", "operador": "Operador"}).fillna(display["rol"])
+    display["Estado"] = display["activo"].map({1: "Activo", 0: "Inactivo"})
+    display = display[["username", "nombre", "Rol", "Estado", "creado"]]
+    display.columns = ["Usuario", "Nombre", "Rol", "Estado", "Creado"]
+    st.dataframe(
+        display,
+        width="stretch",
+        hide_index=True,
+        column_config={"Creado": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm")},
+    )
+
+    st.markdown("#### Editar usuario")
+    selected_username = st.selectbox(
+        "Selecciona un usuario",
+        users_df["username"].tolist(),
+        key="manage_user_selector",
+    )
+    selected = users_df.loc[users_df["username"] == selected_username].iloc[0]
+    with st.form("edit_user_form"):
+        edit_left, edit_right = st.columns(2)
+        edit_name = edit_left.text_input("Nombre", value=str(selected["nombre"]))
+        edit_role = edit_right.selectbox(
+            "Rol",
+            ["Operador", "Administrador"],
+            index=1 if selected["rol"] == "admin" else 0,
+        )
+        active = edit_left.checkbox("Usuario activo", value=bool(selected["activo"]))
+        new_password = edit_right.text_input(
+            "Nueva contraseña (opcional)",
+            type="password",
+            help="Déjalo vacío si no quieres cambiarla.",
+        )
+        confirm_new_password = edit_right.text_input("Confirmar nueva contraseña", type="password")
+        save_changes = st.form_submit_button("Guardar cambios", type="primary", width="stretch")
+    if save_changes:
+        if new_password != confirm_new_password:
+            st.error("Las nuevas contraseñas no coinciden.")
+        else:
+            rol = "admin" if edit_role == "Administrador" else "operador"
+            ok, message = update_app_user(
+                int(selected["id"]),
+                edit_name,
+                rol,
+                active,
+                new_password,
+            )
+            if ok:
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
 
 
 def login_required() -> bool:
     users = configured_users()
-    if not users and not BUILTIN_OPERATOR_USERS:
-        st.session_state.setdefault("username", "Operador local")
-        st.session_state.setdefault("role", "admin")
-        st.caption("Modo local: el acceso con contraseña se activará al publicar la aplicación.")
-        return True
     if st.session_state.get("authenticated"):
         top_left, top_right = st.columns([8, 1])
         role_label = "Administrador" if st.session_state.get("role", "admin") == "admin" else "Operador"
@@ -1788,6 +1974,7 @@ def login_required() -> bool:
             st.session_state.clear()
             st.rerun()
         return True
+
     st.title("📦 Karay Fill Rate")
     st.subheader("Iniciar sesión")
     with st.form("login"):
@@ -1795,17 +1982,20 @@ def login_required() -> bool:
         password = st.text_input("Contraseña", type="password")
         submitted = st.form_submit_button("Ingresar", type="primary", width="stretch")
     if submitted:
-        expected = users.get(username)
+        typed_username = username.strip()
+        expected = users.get(typed_username)
         if expected is not None and hmac.compare_digest(password, expected):
             st.session_state["authenticated"] = True
-            st.session_state["username"] = username
+            st.session_state["username"] = typed_username
             st.session_state["role"] = "admin"
             st.rerun()
-        operator = verify_builtin_operator(username, password)
-        if operator is not None:
+
+        db_user = authenticate_database_user(typed_username, password)
+        if db_user is not None:
             st.session_state["authenticated"] = True
-            st.session_state["username"] = str(operator.get("display_name") or username)
-            st.session_state["role"] = str(operator.get("role") or "operador")
+            st.session_state["username"] = str(db_user.get("nombre") or db_user["username"])
+            st.session_state["role"] = str(db_user.get("rol") or "operador")
+            st.session_state["user_id"] = int(db_user["id"])
             st.rerun()
         st.error("Usuario o contraseña incorrectos.")
     return False
@@ -1813,9 +2003,9 @@ def login_required() -> bool:
 
 def main() -> None:
     st.set_page_config(page_title="Karay Fill Rate", page_icon="📦", layout="wide")
+    init_database()
     if not login_required():
         return
-    init_database()
     st.title("📦 Karay Fill Rate")
     role = st.session_state.get("role", "admin")
     if role == "operador":
@@ -1823,13 +2013,17 @@ def main() -> None:
         processing_tab()
         return
 
-    process, history, forecast = st.tabs(["📦 Procesar pedidos", "🕘 Histórico", "📊 Indicadores"])
+    process, history, forecast, users = st.tabs([
+        "📦 Procesar pedidos", "🕘 Histórico", "📊 Indicadores", "👥 Usuarios"
+    ])
     with process:
         processing_tab()
     with history:
         history_tab()
     with forecast:
         forecast_tab()
+    with users:
+        users_tab()
 
 
 if __name__ == "__main__":
