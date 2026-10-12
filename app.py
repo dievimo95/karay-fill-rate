@@ -1393,9 +1393,26 @@ def processing_tab() -> None:
             st.markdown("#### Análisis rápido por marca")
 
             st.caption("Selecciona una marca para revisar sus productos de inmediato.")
-            marca = st.radio(
+            st.markdown("""
+            <style>
+            .st-key-detail_quick_brand [data-testid="stSegmentedControl"] button {
+                min-height: 58px !important;
+                min-width: 145px !important;
+                padding: 14px 26px !important;
+                font-size: 18px !important;
+                font-weight: 650 !important;
+                border-radius: 12px !important;
+            }
+            .st-key-detail_quick_brand [data-testid="stSegmentedControl"] {
+                gap: 12px !important;
+                flex-wrap: wrap !important;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            marca = st.segmented_control(
                 "Marca", ["Todas", "El Artesanal", "El Pino", "Otros"],
-                horizontal=True, key="detail_quick_brand",
+                default="Todas", selection_mode="single",
+                key="detail_quick_brand",
             )
             q1, q2 = st.columns([3, 1])
             search_value = q1.text_input(
