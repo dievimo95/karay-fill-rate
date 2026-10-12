@@ -1373,7 +1373,25 @@ def processing_tab() -> None:
                     "cumplimiento_por_cliente.csv",
                     "text/csv",
                 )
-            st.markdown("#### Detalle de productos")
+            st.markdown("#### Detalle completo de cumplimiento")
+            st.dataframe(
+                detail, width="stretch", hide_index=True,
+                column_config={
+                    "fill_rate": st.column_config.NumberColumn("Fill Rate", format="%.2f%%"),
+                    "precio_unitario": st.column_config.NumberColumn("Precio unitario", format="$%.2f"),
+                    "venta_potencial": st.column_config.NumberColumn("Venta potencial", format="$%.2f"),
+                    "venta_facturada": st.column_config.NumberColumn("Venta facturada", format="$%.2f"),
+                    "venta_perdida": st.column_config.NumberColumn("Venta perdida", format="$%.2f"),
+                },
+            )
+            st.download_button(
+                "Descargar detalle completo CSV",
+                detail.to_csv(index=False).encode("utf-8-sig"),
+                "fill_rate_completo.csv", "text/csv",
+            )
+            st.divider()
+            st.markdown("#### Análisis rápido por marca")
+
             st.caption("Selecciona una marca para revisar sus productos de inmediato.")
             marca = st.radio(
                 "Marca", ["Todas", "El Artesanal", "El Pino", "Otros"],
@@ -1444,17 +1462,6 @@ def processing_tab() -> None:
                     ),
                 },
             )
-            with st.expander("📋 Ver tabla completa (OC, código, precios y ventas)"):
-                st.dataframe(
-                    filtered_detail, width="stretch", hide_index=True,
-                    column_config={
-                        "fill_rate": st.column_config.NumberColumn("Fill Rate", format="%.2f%%"),
-                        "precio_unitario": st.column_config.NumberColumn("Precio unitario", format="$%.2f"),
-                        "venta_potencial": st.column_config.NumberColumn("Venta potencial", format="$%.2f"),
-                        "venta_facturada": st.column_config.NumberColumn("Venta facturada", format="$%.2f"),
-                        "venta_perdida": st.column_config.NumberColumn("Venta perdida", format="$%.2f"),
-                    },
-                )
             st.download_button(
                 "Descargar selección CSV",
                 filtered_detail.to_csv(index=False).encode("utf-8-sig"),
