@@ -1399,7 +1399,7 @@ def processing_tab() -> None:
                 min-height: 58px !important;
                 min-width: 145px !important;
                 padding: 14px 26px !important;
-                font-size: 18px !important;
+                font-size: 22.5px !important;
                 font-weight: 650 !important;
                 border-radius: 12px !important;
             }
