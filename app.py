@@ -61,6 +61,7 @@ detalle_table = Table(
     Column("venta_facturada", Float, nullable=False),
     Column("venta_perdida", Float, nullable=False),
     Column("fill_rate", Float, nullable=False),
+    Column("no_enviado_planta", Float, nullable=False, default=0),
 )
 Index("idx_detalle_carga", detalle_table.c.carga_id)
 Index("idx_detalle_oc", detalle_table.c.oc)
@@ -188,6 +189,19 @@ def init_database() -> None:
                 db.execute(sql_text(
                     "ALTER TABLE facturas_acumuladas ADD COLUMN "
                     "linea_negocio VARCHAR(80) NOT NULL DEFAULT 'Karay'"
+                ))
+        # Keep previously saved run details while adding production attribution.
+        if engine.dialect.name == "postgresql":
+            db.execute(sql_text(
+                "ALTER TABLE detalle_fillrate ADD COLUMN IF NOT EXISTS "
+                "no_enviado_planta FLOAT NOT NULL DEFAULT 0"
+            ))
+        elif engine.dialect.name == "sqlite":
+            columns = {row[1] for row in db.execute(sql_text("PRAGMA table_info(detalle_fillrate)"))}
+            if "no_enviado_planta" not in columns:
+                db.execute(sql_text(
+                    "ALTER TABLE detalle_fillrate ADD COLUMN "
+                    "no_enviado_planta FLOAT NOT NULL DEFAULT 0"
                 ))
         db.execute(sql_text(
             "UPDATE forecast SET periodo = periodo || '|Karay' "
@@ -1188,6 +1202,7 @@ def save_run(
             record = {"carga_id": run_id}
             for column in DETAIL_COLUMNS:
                 record[column] = str(row[column]) if column in ("oc", "codigo", "producto") else float(row[column])
+            record["no_enviado_planta"] = float(row.get("no_enviado_planta", 0))
             records.append(record)
         db.execute(insert(detalle_table), records)
     return run_id, created
@@ -1277,6 +1292,7 @@ def processing_tab() -> None:
                 for warning in order_warnings + invoice_warnings:
                     st.warning(warning)
                 return
+            detail["no_enviado_planta"] = 0.0
             summary = totals(detail)
             detected_client = cliente.strip() or next(iter(order_clients + invoice_clients), "Sin especificar")
             st.session_state["pending_result"] = {
@@ -1299,6 +1315,49 @@ def processing_tab() -> None:
         for warning in order_warnings + invoice_warnings:
             st.warning(warning)
 
+    # The general customer Fill Rate remains unchanged. Only missing units
+    # explicitly not sent to the plant are removed from the plant denominator.
+    pending_review = st.session_state.get("pending_result")
+    if pending_review:
+        st.markdown("### 🏭 Clasificar incumplimientos de Producción")
+        st.caption(
+            "De forma predeterminada, todo pendiente se atribuye a Producción. "
+            "En 'No enviado a planta' escribe las unidades pendientes que "
+            "Comercial no solicitó fabricar (por ejemplo, el Ghee). "
+            "Puedes excluir parcialmente un producto."
+        )
+        review = pending_review["detail"].copy()
+        if "no_enviado_planta" not in review:
+            review["no_enviado_planta"] = 0.0
+        missing = review[review["pendientes"] > 0].copy()
+        if not missing.empty:
+            editor = st.data_editor(
+                missing[["cliente", "oc", "codigo", "producto", "pedidas", "facturadas",
+                         "pendientes", "no_enviado_planta"]],
+                key="production_attribution_editor",
+                hide_index=True, width="stretch", num_rows="fixed",
+                disabled=["cliente", "oc", "codigo", "producto", "pedidas", "facturadas", "pendientes"],
+                column_config={
+                    "no_enviado_planta": st.column_config.NumberColumn(
+                        "No enviado a planta (unidades)", min_value=0, step=1,
+                        help="Solo unidades pendientes que NO fueron enviadas a Producción.",
+                    ),
+                },
+            )
+            exclusions = pd.to_numeric(editor["no_enviado_planta"], errors="coerce")
+            bad = exclusions.isna() | (exclusions < 0) | (exclusions > missing["pendientes"] + 0.000001)
+            if bad.any():
+                st.error("Las unidades no enviadas a planta deben estar entre 0 y las unidades pendientes de cada fila.")
+                st.session_state["invalid_production_attribution"] = True
+            else:
+                st.session_state["invalid_production_attribution"] = False
+                review.loc[missing.index, "no_enviado_planta"] = exclusions
+                pending_review["detail"] = review
+                st.session_state["last_result"] = (review, pending_review["summary"])
+        else:
+            st.info("Todos los productos están cumplidos; no hay pendientes que clasificar.")
+            st.session_state["invalid_production_attribution"] = False
+
     save_clicked = action_right.button(
         "2. Guardar y actualizar Forecast",
         type="primary",
@@ -1309,6 +1368,8 @@ def processing_tab() -> None:
         pending = st.session_state.get("pending_result")
         if not pending or not order_files or not invoice_files:
             st.error("Primero carga los archivos y pulsa Procesar y revisar.")
+        elif st.session_state.get("invalid_production_attribution"):
+            st.error("Corrige primero las unidades excluidas del indicador de Producción.")
         elif business_line != pending["business_line"]:
             st.error("La línea de negocio cambió después de la revisión. Procesa nuevamente.")
         elif file_fingerprint(order_files, invoice_files, business_line) != pending["fingerprint"]:
@@ -1335,6 +1396,16 @@ def processing_tab() -> None:
     if "last_result" in st.session_state:
         detail, summary = st.session_state["last_result"]
         show_metrics(summary)
+        if "no_enviado_planta" in detail.columns:
+            excluded = float(detail["no_enviado_planta"].sum())
+            plant_requested = float(detail["pedidas"].sum()) - excluded
+            plant_fulfilled = float(detail["facturadas"].sum())
+            plant_rate = 100 * plant_fulfilled / plant_requested if plant_requested > 0 else 100.0
+            a, b, c = st.columns(3)
+            a.metric("Fill Rate Producción", f"{plant_rate:.2f}%")
+            b.metric("Pendiente de Producción", f"{max(plant_requested - plant_fulfilled, 0):,.0f} un.")
+            c.metric("No enviado a planta (Comercial)", f"{excluded:,.0f} un.")
+            st.caption("El Fill Rate general y la venta dejada de facturar no cambian.")
         customer_summary = customer_unit_summary(detail)
         if not customer_summary.empty:
             st.markdown("### Cumplimiento por cliente (unidades)")
@@ -1452,6 +1523,12 @@ def history_tab() -> None:
             select(*detail_columns).where(detalle_table.c.carga_id == int(selected)).order_by(detalle_table.c.oc, detalle_table.c.producto),
             db,
         )
+    if "no_enviado_planta" in detail:
+        excluded = float(detail["no_enviado_planta"].sum())
+        requested_plant = float(detail["pedidas"].sum()) - excluded
+        billed_plant = float(detail["facturadas"].sum())
+        st.metric("Fill Rate Producción (histórico)",
+                  f"{100 * billed_plant / requested_plant if requested_plant else 100:.2f}%")
     st.dataframe(detail, width="stretch", hide_index=True)
     st.download_button("Descargar este detalle", detail.to_csv(index=False).encode("utf-8-sig"), f"fill_rate_{selected}.csv", "text/csv")
 
