@@ -1373,56 +1373,90 @@ def processing_tab() -> None:
                     "cumplimiento_por_cliente.csv",
                     "text/csv",
                 )
-            st.markdown("#### Filtrar detalle de productos")
+            st.markdown("#### Detalle de productos")
+            st.caption("Selecciona una marca para revisar sus productos de inmediato.")
+            marca = st.radio(
+                "Marca", ["Todas", "El Artesanal", "El Pino", "Otros"],
+                horizontal=True, key="detail_quick_brand",
+            )
+            q1, q2 = st.columns([3, 1])
+            search_value = q1.text_input(
+                "Buscar producto, código u OC", placeholder="Escribe Ghee, Yogurt, un código o una OC...",
+                key="detail_quick_search"
+            ).strip()
+            pending_only = q2.toggle(
+                "Solo incumplidos", key="detail_quick_pending"
+            )
             filtered_detail = detail.copy()
             product_names = filtered_detail["producto"].fillna("").astype(str).str.upper()
-            filtered_detail["marca_filtro"] = product_names.map(
-                lambda name: "El Artesanal" if "ARTESANAL" in name
-                else "El Pino" if "EL PINO" in name
-                else "Otros productos"
+            brand_values = product_names.map(
+                lambda value: "El Artesanal" if "ARTESANAL" in value
+                else "El Pino" if "EL PINO" in value else "Otros"
             )
-            f1, f2, f3 = st.columns(3)
-            brands = f1.multiselect(
-                "Marca", ["El Artesanal", "El Pino", "Otros productos"],
-                default=["El Artesanal", "El Pino", "Otros productos"],
-                key="detail_filter_brands"
-            )
-            clients = f2.multiselect(
-                "Cliente", sorted(filtered_detail["cliente"].dropna().unique().tolist()),
-                default=sorted(filtered_detail["cliente"].dropna().unique().tolist()),
-                key="detail_filter_clients"
-            )
-            pending_only = f3.checkbox("Solo productos con incumplimiento", key="detail_pending_only")
-            search_value = st.text_input(
-                "Buscar por producto, código u orden de compra",
-                placeholder="Ej.: Ghee, 7862123511855 o número de OC",
-                key="detail_filter_search"
-            ).strip()
-            filtered_detail = filtered_detail[
-                filtered_detail["marca_filtro"].isin(brands)
-                & filtered_detail["cliente"].isin(clients)
-            ]
+            if marca != "Todas":
+                filtered_detail = filtered_detail[brand_values == marca]
             if pending_only:
                 filtered_detail = filtered_detail[filtered_detail["pendientes"] > 0]
             if search_value:
-                matches = (
-                    filtered_detail[["producto", "codigo", "oc"]]
-                    .fillna("").astype(str).apply(
-                        lambda col: col.str.contains(search_value, case=False, regex=False)
-                    ).any(axis=1)
+                match = filtered_detail[["producto", "codigo", "oc"]].fillna("").astype(str).apply(
+                    lambda col: col.str.contains(search_value, case=False, regex=False)
+                ).any(axis=1)
+                filtered_detail = filtered_detail[match]
+            with st.expander("⚙️ Más filtros", expanded=False):
+                client_options = sorted(detail["cliente"].dropna().unique().tolist())
+                selected_clients = st.multiselect(
+                    "Clientes", client_options, default=client_options,
+                    key="detail_advanced_clients"
                 )
-                filtered_detail = filtered_detail[matches]
-            filtered_detail = filtered_detail.drop(columns=["marca_filtro"])
-            st.caption(f"Mostrando {len(filtered_detail)} de {len(detail)} productos. Los indicadores generales no cambian al filtrar.")
-            st.dataframe(filtered_detail, width="stretch", hide_index=True, column_config={
-                "fill_rate": st.column_config.NumberColumn("Fill Rate", format="%.2f%%"),
-                "precio_unitario": st.column_config.NumberColumn("Precio unitario", format="$%.2f"),
-                "venta_potencial": st.column_config.NumberColumn("Venta potencial", format="$%.2f"),
-                "venta_facturada": st.column_config.NumberColumn("Venta facturada", format="$%.2f"),
-                "venta_perdida": st.column_config.NumberColumn("Venta perdida", format="$%.2f"),
-            })
+                min_fill, max_fill = st.slider(
+                    "Rango de Fill Rate por producto (%)", 0, 100, (0, 100),
+                    key="detail_advanced_fill"
+                )
+            filtered_detail = filtered_detail[
+                filtered_detail["cliente"].isin(selected_clients)
+                & filtered_detail["fill_rate"].between(min_fill, max_fill)
+            ]
+            ordered = float(filtered_detail["pedidas"].sum())
+            delivered = float(filtered_detail["facturadas"].sum())
+            pending_units = float(filtered_detail["pendientes"].sum())
+            subset_rate = 100 * delivered / ordered if ordered else 0.0
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Fill Rate selección", f"{subset_rate:.2f}%" if ordered else "—")
+            m2.metric("Pedidas", f"{ordered:,.0f}")
+            m3.metric("Facturadas", f"{delivered:,.0f}")
+            m4.metric("Pendientes", f"{pending_units:,.0f}")
+            st.caption(
+                f"{len(filtered_detail)} de {len(detail)} filas · Estas cifras corresponden solo al filtro. "
+                "Los indicadores generales de arriba no cambian."
+            )
+            compact = filtered_detail[[
+                "producto", "pedidas", "facturadas", "pendientes", "fill_rate"
+            ]].copy()
+            st.dataframe(
+                compact, width="stretch", hide_index=True,
+                column_config={
+                    "producto": st.column_config.TextColumn("Producto", width="large"),
+                    "pedidas": st.column_config.NumberColumn("Pedidas", format="%.0f"),
+                    "facturadas": st.column_config.NumberColumn("Facturadas", format="%.0f"),
+                    "pendientes": st.column_config.NumberColumn("Pendientes", format="%.0f"),
+                    "fill_rate": st.column_config.ProgressColumn(
+                        "Cumplimiento", min_value=0, max_value=100, format="%.1f%%"
+                    ),
+                },
+            )
+            with st.expander("📋 Ver tabla completa (OC, código, precios y ventas)"):
+                st.dataframe(
+                    filtered_detail, width="stretch", hide_index=True,
+                    column_config={
+                        "fill_rate": st.column_config.NumberColumn("Fill Rate", format="%.2f%%"),
+                        "precio_unitario": st.column_config.NumberColumn("Precio unitario", format="$%.2f"),
+                        "venta_potencial": st.column_config.NumberColumn("Venta potencial", format="$%.2f"),
+                        "venta_facturada": st.column_config.NumberColumn("Venta facturada", format="$%.2f"),
+                        "venta_perdida": st.column_config.NumberColumn("Venta perdida", format="$%.2f"),
+                    },
+                )
             st.download_button(
-                "Descargar detalle filtrado CSV",
+                "Descargar selección CSV",
                 filtered_detail.to_csv(index=False).encode("utf-8-sig"),
                 "fill_rate_filtrado.csv", "text/csv"
             )
