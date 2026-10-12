@@ -1373,15 +1373,60 @@ def processing_tab() -> None:
                     "cumplimiento_por_cliente.csv",
                     "text/csv",
                 )
-            st.dataframe(detail, width="stretch", hide_index=True, column_config={
+            st.markdown("#### Filtrar detalle de productos")
+            filtered_detail = detail.copy()
+            product_names = filtered_detail["producto"].fillna("").astype(str).str.upper()
+            filtered_detail["marca_filtro"] = product_names.map(
+                lambda name: "El Artesanal" if "ARTESANAL" in name
+                else "El Pino" if "EL PINO" in name
+                else "Otros productos"
+            )
+            f1, f2, f3 = st.columns(3)
+            brands = f1.multiselect(
+                "Marca", ["El Artesanal", "El Pino", "Otros productos"],
+                default=["El Artesanal", "El Pino", "Otros productos"],
+                key="detail_filter_brands"
+            )
+            clients = f2.multiselect(
+                "Cliente", sorted(filtered_detail["cliente"].dropna().unique().tolist()),
+                default=sorted(filtered_detail["cliente"].dropna().unique().tolist()),
+                key="detail_filter_clients"
+            )
+            pending_only = f3.checkbox("Solo productos con incumplimiento", key="detail_pending_only")
+            search_value = st.text_input(
+                "Buscar por producto, código u orden de compra",
+                placeholder="Ej.: Ghee, 7862123511855 o número de OC",
+                key="detail_filter_search"
+            ).strip()
+            filtered_detail = filtered_detail[
+                filtered_detail["marca_filtro"].isin(brands)
+                & filtered_detail["cliente"].isin(clients)
+            ]
+            if pending_only:
+                filtered_detail = filtered_detail[filtered_detail["pendientes"] > 0]
+            if search_value:
+                matches = (
+                    filtered_detail[["producto", "codigo", "oc"]]
+                    .fillna("").astype(str).apply(
+                        lambda col: col.str.contains(search_value, case=False, regex=False)
+                    ).any(axis=1)
+                )
+                filtered_detail = filtered_detail[matches]
+            filtered_detail = filtered_detail.drop(columns=["marca_filtro"])
+            st.caption(f"Mostrando {len(filtered_detail)} de {len(detail)} productos. Los indicadores generales no cambian al filtrar.")
+            st.dataframe(filtered_detail, width="stretch", hide_index=True, column_config={
                 "fill_rate": st.column_config.NumberColumn("Fill Rate", format="%.2f%%"),
                 "precio_unitario": st.column_config.NumberColumn("Precio unitario", format="$%.2f"),
                 "venta_potencial": st.column_config.NumberColumn("Venta potencial", format="$%.2f"),
                 "venta_facturada": st.column_config.NumberColumn("Venta facturada", format="$%.2f"),
                 "venta_perdida": st.column_config.NumberColumn("Venta perdida", format="$%.2f"),
             })
-            st.download_button("Descargar detalle CSV", detail.to_csv(index=False).encode("utf-8-sig"), "fill_rate.csv", "text/csv")
-    
+            st.download_button(
+                "Descargar detalle filtrado CSV",
+                filtered_detail.to_csv(index=False).encode("utf-8-sig"),
+                "fill_rate_filtrado.csv", "text/csv"
+            )
+
         with attribution_tab:
             st.write("Clasifica los incumplimientos sin modificar el cumplimiento general.")
         # The general customer Fill Rate remains unchanged. Only missing units
